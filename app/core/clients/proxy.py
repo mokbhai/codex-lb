@@ -2387,6 +2387,7 @@ async def compact_responses(
     headers: Mapping[str, str],
     access_token: str,
     account_id: str | None,
+    base_url: str | None = None,
     session: aiohttp.ClientSession | None = None,
 ) -> CompactResponsePayload:
     async with lease_http_session(session) as client_session:
@@ -2395,6 +2396,7 @@ async def compact_responses(
             headers=headers,
             access_token=access_token,
             account_id=account_id,
+            base_url=base_url,
             session=client_session,
         )
         return await transport.execute()
@@ -2410,11 +2412,12 @@ class _CompactCommandTransport:
     headers: Mapping[str, str]
     access_token: str
     account_id: str | None
+    base_url: str | None
     session: aiohttp.ClientSession
 
     async def execute(self) -> CompactResponsePayload:
         settings = get_settings()
-        upstream_base = settings.upstream_base_url.rstrip("/")
+        upstream_base = (self.base_url or settings.upstream_base_url).rstrip("/")
         url = f"{upstream_base}/codex/responses/compact"
         upstream_headers = _build_upstream_headers(
             self.headers,

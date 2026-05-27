@@ -174,6 +174,7 @@ from app.modules.proxy.http_bridge_forwarding import (
     HTTPBridgeOwnerClient,
     OwnerForwardRelayFailure,
 )
+from app.modules.proxy.account_routing_config import AccountRoutingConfig, get_account_routing_config_store
 from app.modules.proxy.load_balancer import AccountSelection, LoadBalancer
 from app.modules.proxy.rate_limit_cache import get_rate_limit_headers_cache
 from app.modules.proxy.repo_bundle import ProxyRepoFactory, ProxyRepositories
@@ -552,6 +553,44 @@ class ProxyService:
                 ),
             )
         return self._work_admission
+
+    def _account_routing_config(self, account_id: str) -> AccountRoutingConfig | None:
+        return get_account_routing_config_store().get(account_id)
+
+    def _uses_custom_api_key(self, account: Account) -> bool:
+        config = self._account_routing_config(account.id)
+        return config is not None and config.custom_api_key is not None
+
+    def _resolved_upstream_credentials(self, account: Account) -> tuple[str, str | None, str | None]:
+        access_token = self._encryptor.decrypt(account.access_token_encrypted)
+        upstream_account_id = _header_account_id(account.chatgpt_account_id)
+        base_url: str | None = None
+        config = self._account_routing_config(account.id)
+        if config is not None:
+            if config.custom_api_key is not None:
+                access_token = config.custom_api_key
+                upstream_account_id = None
+            base_url = config.custom_base_url
+        return access_token, upstream_account_id, base_url
+
+    def _map_model_for_account(self, account: Account, model: str | None) -> str | None:
+        if model is None:
+            return None
+        config = self._account_routing_config(account.id)
+        if config is None:
+            return model
+        mapped = config.model_mapping.get(model)
+        return mapped or model
+
+    def _mapped_payload_for_account(
+        self,
+        account: Account,
+        payload: _ResponsesPayloadT,
+    ) -> _ResponsesPayloadT:
+        mapped_model = self._map_model_for_account(account, payload.model)
+        if mapped_model == payload.model:
+            return payload
+        return cast("_ResponsesPayloadT", payload.model_copy(update={"model": mapped_model}))
 
     def stream_responses(
         self,
@@ -1987,8 +2026,8 @@ class ProxyService:
         try:
 
             async def _call_compact(target: Account) -> CompactResponsePayload:
-                access_token = self._encryptor.decrypt(target.access_token_encrypted)
-                account_id = _header_account_id(target.chatgpt_account_id)
+                mapped_payload = self._mapped_payload_for_account(target, payload)
+                access_token, account_id, base_url = self._resolved_upstream_credentials(target)
                 remaining_budget = _remaining_budget_seconds(deadline)
                 if remaining_budget <= 0:
                     logger.warning(
@@ -2008,7 +2047,13 @@ class ProxyService:
                     )
                 create_lease = await self._get_work_admission().acquire_response_create(compact=True)
                 try:
-                    return await core_compact_responses(payload, filtered, access_token, account_id)
+                    return await core_compact_responses(
+                        mapped_payload,
+                        filtered,
+                        access_token,
+                        account_id,
+                        base_url=base_url,
+                    )
                 finally:
                     create_lease.release()
                     pop_compact_timeout_overrides(timeout_tokens)
@@ -2357,8 +2402,7 @@ class ProxyService:
             account_id_value = account.id
 
             async def _call_goal(target: Account) -> dict[str, JsonValue]:
-                access_token = self._encryptor.decrypt(target.access_token_encrypted)
-                upstream_account_id = _header_account_id(target.chatgpt_account_id)
+                access_token, upstream_account_id, base_url = self._resolved_upstream_credentials(target)
                 remaining_budget = _remaining_budget_seconds(deadline)
                 if remaining_budget <= 0:
                     logger.warning(
@@ -2377,6 +2421,7 @@ class ProxyService:
                     upstream_account_id,
                     method=method,
                     timeout_seconds=remaining_budget,
+                    base_url=base_url,
                 )
 
             try:
@@ -2568,8 +2613,7 @@ class ProxyService:
             account_id_value = account.id
 
             async def _call_control(target: Account) -> CodexControlResponse:
-                access_token = self._encryptor.decrypt(target.access_token_encrypted)
-                upstream_account_id = _header_account_id(target.chatgpt_account_id)
+                access_token, upstream_account_id, base_url = self._resolved_upstream_credentials(target)
                 remaining_budget = _remaining_budget_seconds(deadline)
                 if remaining_budget <= 0:
                     logger.warning(
@@ -2589,6 +2633,7 @@ class ProxyService:
                     access_token=access_token,
                     account_id=upstream_account_id,
                     timeout_seconds=remaining_budget,
+                    base_url=base_url,
                 )
 
             try:
@@ -2762,8 +2807,7 @@ class ProxyService:
             account_id_value = account.id
 
             async def _call_transcribe(target: Account) -> dict[str, JsonValue]:
-                access_token = self._encryptor.decrypt(target.access_token_encrypted)
-                account_id = _header_account_id(target.chatgpt_account_id)
+                access_token, account_id, base_url = self._resolved_upstream_credentials(target)
                 remaining_budget = _remaining_budget_seconds(deadline)
                 if remaining_budget <= 0:
                     logger.warning(
@@ -2785,6 +2829,7 @@ class ProxyService:
                         headers=filtered,
                         access_token=access_token,
                         account_id=account_id,
+                        base_url=base_url,
                     )
                 finally:
                     pop_transcribe_timeout_overrides(timeout_tokens)
@@ -3094,11 +3139,12 @@ class ProxyService:
             kind="files-create",
             api_key=api_key,
             headers=headers,
-            invoke=lambda access_token, upstream_account_id, filtered_headers: core_create_file(
+            invoke=lambda access_token, upstream_account_id, base_url, filtered_headers: core_create_file(
                 payload=payload,
                 headers=filtered_headers,
                 access_token=access_token,
                 account_id=upstream_account_id,
+                base_url=base_url,
             ),
         )
         # Best-effort pin so finalize lands on the same account.
@@ -3136,11 +3182,12 @@ class ProxyService:
             api_key=api_key,
             headers=headers,
             preferred_account_id=pinned_account_id,
-            invoke=lambda access_token, upstream_account_id, filtered_headers: core_finalize_file(
+            invoke=lambda access_token, upstream_account_id, base_url, filtered_headers: core_finalize_file(
                 file_id=file_id,
                 headers=filtered_headers,
                 access_token=access_token,
                 account_id=upstream_account_id,
+                base_url=base_url,
             ),
         )
         if isinstance(result, dict) and account_id:
@@ -3156,7 +3203,7 @@ class ProxyService:
         kind: str,
         api_key: ApiKeyData | None,
         headers: Mapping[str, str],
-        invoke: Callable[[str, str | None, Mapping[str, str]], Awaitable[dict[str, JsonValue]]],
+        invoke: Callable[[str, str | None, str | None, Mapping[str, str]], Awaitable[dict[str, JsonValue]]],
         preferred_account_id: str | None = None,
     ) -> tuple[dict[str, JsonValue], str | None]:
         """Shared account-selection / refresh / 401-retry plumbing for `/files` calls.
@@ -3204,8 +3251,7 @@ class ProxyService:
             account_id_value = account.id
 
             async def _call(target: Account) -> dict[str, JsonValue]:
-                access_token = self._encryptor.decrypt(target.access_token_encrypted)
-                account_id = _header_account_id(target.chatgpt_account_id)
+                access_token, account_id, base_url = self._resolved_upstream_credentials(target)
                 remaining_budget = _remaining_budget_seconds(deadline)
                 if remaining_budget <= 0:
                     logger.warning(
@@ -3225,7 +3271,7 @@ class ProxyService:
                     total_timeout_seconds=remaining_budget,
                 )
                 try:
-                    return await invoke(access_token, account_id, filtered)
+                    return await invoke(access_token, account_id, base_url, filtered)
                 except FileProxyError as files_exc:
                     raise ProxyResponseError(files_exc.status_code, files_exc.payload) from files_exc
                 finally:
@@ -4893,11 +4939,10 @@ class ProxyService:
         account: Account,
         headers: dict[str, str],
     ) -> UpstreamResponsesWebSocket:
-        access_token = self._encryptor.decrypt(account.access_token_encrypted)
-        account_id = _header_account_id(account.chatgpt_account_id)
+        access_token, account_id, base_url = self._resolved_upstream_credentials(account)
         connect_lease = await self._get_work_admission().acquire_websocket_connect()
         try:
-            return await connect_responses_websocket(headers, access_token, account_id)
+            return await connect_responses_websocket(headers, access_token, account_id, base_url=base_url)
         finally:
             connect_lease.release()
 
@@ -10362,8 +10407,8 @@ class ProxyService:
         tool_call_dedupe: _WebSocketUpstreamControl | None = None,
     ) -> AsyncIterator[str]:
         account_id_value = account.id
-        access_token = self._encryptor.decrypt(account.access_token_encrypted)
-        account_id = _header_account_id(account.chatgpt_account_id)
+        mapped_payload = self._mapped_payload_for_account(account, payload)
+        access_token, account_id, base_url = self._resolved_upstream_credentials(account)
         model = payload.model
         requested_service_tier = payload.service_tier
         service_tier = requested_service_tier
@@ -10401,19 +10446,21 @@ class ProxyService:
             response_create_lease = await self._get_work_admission().acquire_response_create()
             if upstream_stream_transport is not None:
                 stream = core_stream_responses(
-                    payload,
+                    mapped_payload,
                     headers,
                     access_token,
                     account_id,
+                    base_url=base_url,
                     raise_for_status=True,
                     upstream_stream_transport_override=upstream_stream_transport,
                 )
             else:
                 stream = core_stream_responses(
-                    payload,
+                    mapped_payload,
                     headers,
                     access_token,
                     account_id,
+                    base_url=base_url,
                     raise_for_status=True,
                 )
             iterator = stream.__aiter__()
@@ -11135,6 +11182,8 @@ class ProxyService:
         force: bool = False,
         timeout_seconds: float | None = None,
     ) -> Account:
+        if self._uses_custom_api_key(account):
+            return account
         token = push_token_refresh_timeout_override(timeout_seconds)
         try:
             async with self._repo_factory() as repos:

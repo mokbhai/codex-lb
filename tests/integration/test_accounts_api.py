@@ -231,6 +231,50 @@ async def test_set_and_clear_account_alias(async_client):
     assert matched["alias"] is None
     assert matched["displayName"] == email
 
+
+@pytest.mark.asyncio
+async def test_set_account_custom_routing(async_client):
+    email = "routing@example.com"
+    raw_account_id = "acc_routing"
+    payload = {
+        "email": email,
+        "chatgpt_account_id": raw_account_id,
+        "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"},
+    }
+    auth_json = {
+        "tokens": {
+            "idToken": _encode_jwt(payload),
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "accountId": raw_account_id,
+        },
+    }
+
+    expected_account_id = generate_unique_account_id(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    update = await async_client.put(
+        f"/api/accounts/{expected_account_id}/custom-routing",
+        json={
+            "customApiKey": "sk-custom-key",
+            "customBaseUrl": " https://api.custom-provider.com/v1 ",
+            "modelMapping": {"gpt-5.5": "deepseek-v4-pro", "claude-sonnet": "qwen-max"},
+        },
+    )
+    assert update.status_code == 200
+    body = update.json()
+    assert body == {
+        "accountId": expected_account_id,
+        "hasCustomApiKey": True,
+        "customBaseUrl": "https://api.custom-provider.com/v1",
+        "modelMapping": {
+            "gpt-5.5": "deepseek-v4-pro",
+            "claude-sonnet": "qwen-max",
+        },
+    }
+
     # Setting an alias updates both `alias` and `displayName`.
     set_response = await async_client.put(
         f"/api/accounts/{expected_account_id}/alias",

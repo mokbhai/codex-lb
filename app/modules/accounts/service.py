@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import cast
 
@@ -15,7 +16,7 @@ from app.core.auth import (
     token_expiry_epoch_ms,
 )
 from app.core.auth.api_key_cache import get_api_key_cache
-from app.core.cache.invalidation import NAMESPACE_API_KEY, get_cache_invalidation_poller
+from app.core.cache.invalidation import NAMESPACE_ACCOUNT_ROUTING, NAMESPACE_API_KEY, get_cache_invalidation_poller
 from app.core.crypto import TokenEncryptor
 from app.core.plan_types import coerce_account_plan_type
 from app.core.utils.time import naive_utc_to_epoch, to_utc_naive, utcnow
@@ -37,6 +38,7 @@ from app.modules.accounts.schemas import (
 )
 from app.modules.limit_warmup.repository import LimitWarmupRepository
 from app.modules.proxy.account_cache import get_account_selection_cache
+from app.modules.proxy.account_routing_config import normalize_model_mapping, serialize_model_mapping
 from app.modules.usage.additional_quota_keys import get_additional_display_label_for_quota_key
 from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 from app.modules.usage.updater import AdditionalUsageRepositoryPort, UsageUpdater
@@ -47,6 +49,13 @@ _DETAIL_BUCKET_SECONDS = 3600  # 1h → 168 points
 
 class InvalidAuthJsonError(Exception):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class AccountCustomRoutingConfigResult:
+    has_custom_api_key: bool
+    custom_base_url: str | None
+    model_mapping: dict[str, str]
 
 
 class AccountsService:
@@ -242,6 +251,7 @@ class AccountsService:
             poller = get_cache_invalidation_poller()
             if poller is not None:
                 await poller.bump(NAMESPACE_API_KEY)
+                await poller.bump(NAMESPACE_ACCOUNT_ROUTING)
         return result
 
     async def set_account_alias(self, account_id: str, alias: str | None) -> bool:
@@ -249,6 +259,38 @@ class AccountsService:
         if normalized == "":
             normalized = None
         return await self._repo.update_alias(account_id, normalized)
+
+    async def set_account_custom_routing(
+        self,
+        account_id: str,
+        *,
+        custom_api_key: str | None,
+        custom_base_url: str | None,
+        model_mapping: dict[str, str],
+    ) -> AccountCustomRoutingConfigResult | None:
+        normalized_api_key = custom_api_key.strip() if isinstance(custom_api_key, str) else None
+        if normalized_api_key == "":
+            normalized_api_key = None
+        normalized_base_url = custom_base_url.strip() if isinstance(custom_base_url, str) else None
+        if normalized_base_url == "":
+            normalized_base_url = None
+        normalized_model_mapping = normalize_model_mapping(model_mapping)
+        success = await self._repo.update_custom_routing(
+            account_id,
+            custom_api_key_encrypted=self._encryptor.encrypt(normalized_api_key) if normalized_api_key else None,
+            custom_base_url=normalized_base_url,
+            custom_model_mapping_json=serialize_model_mapping(normalized_model_mapping),
+        )
+        if not success:
+            return None
+        poller = get_cache_invalidation_poller()
+        if poller is not None:
+            await poller.bump(NAMESPACE_ACCOUNT_ROUTING)
+        return AccountCustomRoutingConfigResult(
+            has_custom_api_key=normalized_api_key is not None,
+            custom_base_url=normalized_base_url,
+            model_mapping=normalized_model_mapping,
+        )
 
     async def export_account(self, account_id: str) -> AccountExportResponse | None:
         account = await self._repo.get_by_id(account_id)

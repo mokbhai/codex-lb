@@ -171,3 +171,16 @@ class AccountAliasRequest(DashboardModel):
 class AccountAliasResponse(DashboardModel):
     account_id: str
     alias: str | None = None
+
+
+class AccountCustomRoutingRequest(DashboardModel):
+    custom_api_key: str | None = Field(default=None, max_length=8192)
+    custom_base_url: str | None = Field(default=None, max_length=2048)
+    model_mapping: dict[str, str] = Field(default_factory=dict)
+
+
+class AccountCustomRoutingResponse(DashboardModel):
+    account_id: str
+    has_custom_api_key: bool
+    custom_base_url: str | None = None
+    model_mapping: dict[str, str] = Field(default_factory=dict)

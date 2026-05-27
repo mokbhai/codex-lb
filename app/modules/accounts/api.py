@@ -10,6 +10,8 @@ from app.modules.accounts.repository import AccountIdentityConflictError
 from app.modules.accounts.schemas import (
     AccountAliasRequest,
     AccountAliasResponse,
+    AccountCustomRoutingRequest,
+    AccountCustomRoutingResponse,
     AccountDeleteResponse,
     AccountExportResponse,
     AccountImportResponse,
@@ -147,6 +149,28 @@ async def set_account_alias(
     if normalized == "":
         normalized = None
     return AccountAliasResponse(account_id=account_id, alias=normalized)
+
+
+@router.put("/{account_id}/custom-routing", response_model=AccountCustomRoutingResponse)
+async def set_account_custom_routing(
+    account_id: str,
+    payload: AccountCustomRoutingRequest,
+    context: AccountsContext = Depends(get_accounts_context),
+) -> AccountCustomRoutingResponse:
+    result = await context.service.set_account_custom_routing(
+        account_id,
+        custom_api_key=payload.custom_api_key,
+        custom_base_url=payload.custom_base_url,
+        model_mapping=payload.model_mapping,
+    )
+    if result is None:
+        raise DashboardNotFoundError("Account not found", code="account_not_found")
+    return AccountCustomRoutingResponse(
+        account_id=account_id,
+        has_custom_api_key=result.has_custom_api_key,
+        custom_base_url=result.custom_base_url,
+        model_mapping=result.model_mapping,
+    )
 
 
 @router.put("/{account_id}/limit-warmup", response_model=AccountLimitWarmupUpdateResponse)

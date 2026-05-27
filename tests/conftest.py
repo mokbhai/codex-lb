@@ -138,6 +138,12 @@ def _reset_global_state() -> None:
     except Exception:
         pass
     try:
+        from app.modules.proxy.account_routing_config import get_account_routing_config_store
+
+        get_account_routing_config_store().clear()
+    except Exception:
+        pass
+    try:
         from app.core.resilience.degradation import set_normal
 
         set_normal()

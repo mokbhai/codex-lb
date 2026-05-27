@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 NAMESPACE_API_KEY = "api_key"
 NAMESPACE_FIREWALL = "firewall"
+NAMESPACE_ACCOUNT_ROUTING = "account_routing"
 type InvalidationCallback = Callable[[], None | Awaitable[None]]
 
 

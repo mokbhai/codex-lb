@@ -55,6 +55,9 @@ class Account(Base):
     chatgpt_account_id: Mapped[str | None] = mapped_column(String, nullable=True)
     email: Mapped[str] = mapped_column(String, nullable=False)
     alias: Mapped[str | None] = mapped_column(String, nullable=True)
+    custom_api_key_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    custom_base_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    custom_model_mapping_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     plan_type: Mapped[str] = mapped_column(String, nullable=False)
 
     access_token_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)

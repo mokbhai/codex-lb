@@ -50,6 +50,7 @@ from app.modules.firewall import api as firewall_api
 from app.modules.health import api as health_api
 from app.modules.oauth import api as oauth_api
 from app.modules.proxy import api as proxy_api
+from app.modules.proxy.account_routing_config import refresh_account_routing_config_store
 from app.modules.proxy.durable_bridge_repository import missing_durable_bridge_tables
 from app.modules.proxy.rate_limit_cache import get_rate_limit_headers_cache
 from app.modules.proxy.ring_membership import (
@@ -120,6 +121,7 @@ async def lifespan(app: FastAPI):
 
         init_tracing(service_name="codex-lb", endpoint=settings.otel_exporter_endpoint, app=app)
     await init_db()
+    await refresh_account_routing_config_store()
     init_background_db()
     _auto_bootstrap_token = await ensure_auto_bootstrap_token()
     if _auto_bootstrap_token:
@@ -219,6 +221,7 @@ async def lifespan(app: FastAPI):
 
     from app.core.auth.api_key_cache import get_api_key_cache
     from app.core.cache.invalidation import (
+        NAMESPACE_ACCOUNT_ROUTING,
         NAMESPACE_API_KEY,
         NAMESPACE_FIREWALL,
         CacheInvalidationPoller,
@@ -229,6 +232,7 @@ async def lifespan(app: FastAPI):
     cache_poller = CacheInvalidationPoller(SessionLocal)
     cache_poller.on_invalidation(NAMESPACE_API_KEY, get_api_key_cache().clear)
     cache_poller.on_invalidation(NAMESPACE_FIREWALL, get_firewall_ip_cache().invalidate_all)
+    cache_poller.on_invalidation(NAMESPACE_ACCOUNT_ROUTING, refresh_account_routing_config_store)
     set_cache_invalidation_poller(cache_poller)
     await cache_poller.start()
 

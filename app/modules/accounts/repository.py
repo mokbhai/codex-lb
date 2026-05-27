@@ -217,6 +217,29 @@ class AccountsRepository:
         await self._session.commit()
         return result.scalar_one_or_none() is not None
 
+    async def update_custom_routing(
+        self,
+        account_id: str,
+        *,
+        custom_api_key_encrypted: bytes | None | object = _UNSET,
+        custom_base_url: str | None | object = _UNSET,
+        custom_model_mapping_json: str | None | object = _UNSET,
+    ) -> bool:
+        values: dict[str, bytes | str | None] = {}
+        if custom_api_key_encrypted is not _UNSET:
+            values["custom_api_key_encrypted"] = custom_api_key_encrypted
+        if custom_base_url is not _UNSET:
+            values["custom_base_url"] = custom_base_url
+        if custom_model_mapping_json is not _UNSET:
+            values["custom_model_mapping_json"] = custom_model_mapping_json
+        if not values:
+            return await self.get_by_id(account_id) is not None
+        result = await self._session.execute(
+            update(Account).where(Account.id == account_id).values(**values).returning(Account.id)
+        )
+        await self._session.commit()
+        return result.scalar_one_or_none() is not None
+
     async def update_limit_warmup_enabled(self, account_id: str, enabled: bool) -> bool:
         result = await self._session.execute(
             update(Account).where(Account.id == account_id).values(limit_warmup_enabled=enabled).returning(Account.id)
