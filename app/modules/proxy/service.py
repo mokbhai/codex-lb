@@ -136,6 +136,7 @@ from app.modules.api_keys.service import (
     ApiKeysService,
     ApiKeyUsageReservationData,
 )
+from app.modules.proxy.account_routing_config import AccountRoutingConfig, get_account_routing_config_store
 from app.modules.proxy.affinity import (
     _AffinityPolicy,
     _extract_model_class,
@@ -174,7 +175,6 @@ from app.modules.proxy.http_bridge_forwarding import (
     HTTPBridgeOwnerClient,
     OwnerForwardRelayFailure,
 )
-from app.modules.proxy.account_routing_config import AccountRoutingConfig, get_account_routing_config_store
 from app.modules.proxy.load_balancer import AccountSelection, LoadBalancer
 from app.modules.proxy.rate_limit_cache import get_rate_limit_headers_cache
 from app.modules.proxy.repo_bundle import ProxyRepoFactory, ProxyRepositories

@@ -60,7 +60,7 @@ async def test_custom_routing_model_mapping_rewrites_payload_model() -> None:
         }
     )
 
-    payload = ResponsesRequest(model="gpt-5.5", input="hello")
+    payload = ResponsesRequest(model="gpt-5.5", input="hello", instructions="test")
     mapped = service._mapped_payload_for_account(account, payload)
 
     assert mapped.model == "deepseek-v4-pro"
