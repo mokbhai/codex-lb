@@ -6,7 +6,7 @@
 # Requires external PostgreSQL. Set CODEX_LB_DATABASE_URL in .env.local:
 #   CODEX_LB_DATABASE_URL=postgresql+asyncpg://user:password@host:5432/codexlb
 services:
-  server:
+  codex-lb:
     build:
       context: .
       dockerfile: Dockerfile
