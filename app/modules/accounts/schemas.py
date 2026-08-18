@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import List
 
-from pydantic import Field, field_validator
+from pydantic import Field, PrivateAttr, field_validator
 
 from app.modules.shared.schemas import DashboardModel
 
@@ -100,6 +100,7 @@ class AccountSummary(DashboardModel):
     window_minutes_secondary: int | None = None
     window_minutes_monthly: int | None = None
     last_refresh_at: datetime | None = None
+    usage_refreshed_at: datetime | None = Field(default=None, exclude=True)
     capacity_credits_primary: float | None = None
     remaining_credits_primary: float | None = None
     capacity_credits_secondary: float | None = None
@@ -227,6 +228,8 @@ class AccountProbeRequest(DashboardModel):
 
 
 class AccountProbeResponse(DashboardModel):
+    _usage_refresh_fetch_succeeded: bool | None = PrivateAttr(default=None)
+
     status: str
     account_id: str
     probe_status_code: int
@@ -236,6 +239,9 @@ class AccountProbeResponse(DashboardModel):
     secondary_used_percent_after: float | None = None
     account_status_before: str
     account_status_after: str
+
+    def usage_refresh_ready_for_probe_settlement(self) -> bool:
+        return self._usage_refresh_fetch_succeeded is True
 
 
 class AccountUsageResetConsumeRequest(DashboardModel):

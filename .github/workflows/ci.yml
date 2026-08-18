@@ -40,7 +40,7 @@ jobs:
       migrations: ${{ steps.force.outputs.full_suite || steps.filter.outputs.migrations }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -56,44 +56,9 @@ jobs:
       - name: Detect file changes
         id: filter
         if: steps.force.outputs.full_suite != 'true'
-        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706
-        with:
-          filters: |
-            frontend:
-              - 'frontend/**'
-              - 'Makefile'
-              - '.github/workflows/ci.yml'
-            backend:
-              - '.github/scripts/**'
-              - 'app/**'
-              - 'tests/**'
-              - 'config/**'
-              - 'scripts/**'
-              - 'pyproject.toml'
-              - 'uv.lock'
-              - 'Makefile'
-              - '.github/workflows/ci.yml'
-            helm:
-              - 'deploy/helm/**'
-              - 'Makefile'
-              - '.github/workflows/ci.yml'
-            docker:
-              - 'Dockerfile'
-              - 'Dockerfile.*'
-              - '.dockerignore'
-              - 'docker-compose*.yml'
-              - 'app/**'
-              - 'config/**'
-              - 'frontend/**'
-              - 'scripts/**'
-              - 'pyproject.toml'
-              - 'uv.lock'
-              - '.github/workflows/ci.yml'
-            migrations:
-              - 'app/db/alembic/**'
-              - 'pyproject.toml'
-              - 'uv.lock'
-              - '.github/workflows/ci.yml'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/detect_changed_areas.py
 
   contributors:
     name: Contributors attribution
@@ -101,7 +66,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -117,7 +82,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -144,7 +109,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -172,7 +137,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -202,7 +167,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -225,10 +190,9 @@ jobs:
         run: make frontend-typecheck
 
   frontend-test:
-    # Keep this exact job name: the repository ruleset and
-    # .github/scripts/sync_codex_ok_labels.py treat "Frontend tests
-    # (vitest + coverage)" as a required check context. PR runs skip the
-    # coverage instrumentation below, but the check name must not change.
+    # Keep this exact job name: the repository ruleset requires "Frontend
+    # tests (vitest + coverage)" as a check context. PR runs skip the coverage
+    # instrumentation below, but the check name must not change.
     name: Frontend tests (vitest + coverage)
     runs-on: ubuntu-24.04
     needs: changes
@@ -236,7 +200,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -273,7 +237,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -295,6 +259,55 @@ jobs:
       - name: Build frontend
         run: make frontend-build
 
+  dashboard-browser-smoke:
+    name: Dashboard browser smoke (Playwright)
+    runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.frontend == 'true'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: "1.3.14"
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.bun/install/cache
+            frontend/node_modules
+          key: bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
+          restore-keys: |
+            bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          prune-cache: true
+
+      - name: Install frontend dependencies
+        run: make frontend-install
+
+      - name: Install Playwright Chromium
+        run: cd frontend && bun run playwright install --with-deps chromium
+
+      - name: Run dashboard browser smoke test
+        run: make test-dashboard-browser-smoke
+
   lint:
     name: Lint (ruff)
     runs-on: ubuntu-24.04
@@ -303,15 +316,16 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
         with:
           python-version: "3.13"
           enable-cache: true
+          prune-cache: true
 
       - name: Ruff check
         run: make lint
@@ -324,15 +338,16 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
         with:
           python-version: "3.13"
           enable-cache: true
+          prune-cache: true
 
       - name: Ty check
         run: make typecheck
@@ -359,7 +374,7 @@ jobs:
 
       - name: Checkout repository
         if: needs.changes.outputs.backend == 'true'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -382,10 +397,11 @@ jobs:
 
       - name: Set up uv
         if: needs.changes.outputs.backend == 'true'
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
         with:
           python-version: "3.13"
           enable-cache: true
+          prune-cache: true
 
       - name: Run tests
         if: needs.changes.outputs.backend == 'true'
@@ -413,7 +429,7 @@ jobs:
 
       - name: Checkout repository
         if: needs.changes.outputs.backend == 'true'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -436,21 +452,21 @@ jobs:
 
       - name: Set up uv
         if: needs.changes.outputs.backend == 'true'
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
         with:
           python-version: "3.13"
           enable-cache: true
+          prune-cache: true
 
       - name: Run tests
         if: needs.changes.outputs.backend == 'true'
         run: make test-integration-core-${{ matrix.shard }}
 
   # Aggregate for the shards above. Keep this exact job name: the repository
-  # ruleset and .github/scripts/sync_codex_ok_labels.py treat
-  # "Tests (pytest, integration-core)" as a required check context. The shard
-  # jobs never skip at job level (they use the placeholder-step pattern), so
-  # anything other than an all-success matrix result must fail here —
-  # skipped or cancelled shards are not laundered into a passing check.
+  # ruleset requires "Tests (pytest, integration-core)" as a check context.
+  # The shard jobs never skip at job level (they use the placeholder-step
+  # pattern), so anything other than an all-success matrix result must fail
+  # here — skipped or cancelled shards are not laundered into a passing check.
   test-integration-core-required:
     name: Tests (pytest, integration-core)
     runs-on: ubuntu-24.04
@@ -511,7 +527,7 @@ jobs:
 
       - name: Checkout repository
         if: needs.changes.outputs.backend == 'true'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -534,10 +550,11 @@ jobs:
 
       - name: Set up uv
         if: needs.changes.outputs.backend == 'true'
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
         with:
           python-version: "3.13"
           enable-cache: true
+          prune-cache: true
 
       - name: Run tests
         if: needs.changes.outputs.backend == 'true'
@@ -551,15 +568,16 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
         with:
           python-version: "3.13"
           enable-cache: true
+          prune-cache: true
 
       - name: Validate migration policy and drift
         run: make migration-check
@@ -586,15 +604,16 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
         with:
           python-version: "3.13"
           enable-cache: true
+          prune-cache: true
 
       - name: Validate migration policy and drift on PostgreSQL
         run: make migration-check-postgres
@@ -607,7 +626,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -627,10 +646,11 @@ jobs:
             bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
         with:
           python-version: "3.13"
           enable-cache: true
+          prune-cache: true
 
       - name: Build and verify package
         run: make package
@@ -649,7 +669,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -677,7 +697,7 @@ jobs:
           ignore-unfixed: true
 
       - name: Upload Trivy scan results to GitHub Security
-        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9
+        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd
         if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         with:
           sarif_file: trivy-results.sarif
@@ -702,7 +722,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -750,7 +770,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -803,6 +823,7 @@ jobs:
       - frontend-typecheck
       - frontend-test
       - frontend-build
+      - dashboard-browser-smoke
       - lint
       - typecheck
       - test

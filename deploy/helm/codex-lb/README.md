@@ -112,7 +112,9 @@ Use External Secrets Operator to materialize credentials.
 Key properties:
 
 - `externalSecrets.enabled=true`
+- requires External Secrets Operator v0.17.0 or newer (the first release that serves `external-secrets.io/v1`)
 - DB credentials are not assumed to exist at render time
+- remote secret keys and optional JSON properties are configurable independently
 - migration Job remains `post-install,pre-upgrade`
 - application pods keep the schema gate initContainer enabled and wait for schema head before starting the app container
 
@@ -135,6 +137,26 @@ helm upgrade --install codex-lb deploy/helm/codex-lb/ \
 ```
 
 </details>
+
+By default, both values are read from JSON properties in a remote secret named
+after the release. Providers such as Infisical commonly store each value as an
+individual secret instead. Configure absolute keys and clear the property fields
+for that layout:
+
+```yaml
+externalSecrets:
+  enabled: true
+  secretStoreRef:
+    name: infisical
+    kind: ClusterSecretStore
+  remoteRefs:
+    databaseUrl:
+      key: /apps/codex-lb/DATABASE_URL
+      property: ""
+    encryptionKey:
+      key: /apps/codex-lb/ENCRYPTION_KEY
+      property: ""
+```
 
 ## Quick Start
 
@@ -239,13 +261,23 @@ networkPolicy:
 
 ## Connection Pool Sizing
 
-Each pod keeps its own SQLAlchemy pool.
+Normative contracts: [database backends](../../../openspec/specs/database-backends/)
+and [deployment installation](../../../openspec/specs/deployment-installation/).
+
+Each supported pod runs one application worker with two independent SQLAlchemy
+pools: one for request-path work and one for background tasks.
 
 ```
-total_connections = (databasePoolSize + databaseMaxOverflow) × replicas
+total_connections = (databasePoolSize + databaseMaxOverflow) × 2 pools × 1 worker × replicas
 ```
 
-Keep this within your PostgreSQL `max_connections` budget or place PgBouncer in front of the database.
+Keep this within your PostgreSQL `max_connections` budget, including capacity
+for migrations and administrative clients, or place PgBouncer in front of the
+database.
+
+The owned `app.cli` launcher explicitly pins Uvicorn to one worker, so
+`WEB_CONCURRENCY` does not multiply pools. Custom Uvicorn/Gunicorn multi-worker
+launchers are unsupported; scale through replicas or the HPA.
 
 ## Production Workload
 
@@ -267,8 +299,8 @@ Single-replica deployments can use SQLite, but **multi-replica requires PostgreS
   
 - **Circuit Breaker**: Enabled by default (`config.circuitBreakerEnabled=true`)
   - Protects upstream API endpoints from cascading failures
-  - Opens after `config.circuitBreakerFailureThreshold=5` consecutive failures
-  - Enters half-open state after `config.circuitBreakerRecoveryTimeoutSeconds=60` seconds
+  - Opens after 5 consecutive failures; enters half-open state after 60
+    seconds (fixed application constants)
   - Prevents thundering herd when upstream is degraded
 
 ### Session Bridge Ring
@@ -322,23 +354,29 @@ A static ring is incompatible with autoscaling and must list exactly the Statefu
 
 ### Connection Pool Budget
 
-Each pod maintains its own SQLAlchemy connection pool. The total connections across all replicas must fit within PostgreSQL's `max_connections`:
+Each supported pod maintains one worker with two independent SQLAlchemy
+connection pools: the request pool and the background-task pool. The total
+connections across all replicas must leave room within PostgreSQL's
+`max_connections` for reserved slots, migrations, and operations:
 
 ```
-(databasePoolSize + databaseMaxOverflow) × maxReplicas ≤ PostgreSQL max_connections
+(databasePoolSize + databaseMaxOverflow) × 2 × 1 × maxReplicas ≤ PostgreSQL max_connections - reserve
 ```
 
 **Example for `values-prod.yaml`:**
 
 ```yaml
 config:
-  databasePoolSize: 3
-  databaseMaxOverflow: 2
+  databasePoolSize: 1
+  databaseMaxOverflow: 1
 autoscaling:
   maxReplicas: 20
 ```
 
-Calculation: `(3 + 2) × 20 = 100` connections, which fits within PostgreSQL's default `max_connections=100`.
+Calculation: `(1 + 1) × 2 × 20 = 80` application connections. This fits
+within PostgreSQL's default `max_connections=100` while reserving 20
+raw server slots: three default superuser-reserved slots, two simultaneous
+migrator connections, and fifteen further operational connections.
 
 **Tuning:**
 
@@ -396,42 +434,56 @@ helm install codex-lb oci://ghcr.io/soju06/charts/codex-lb \
 
 ### Graceful Shutdown Tuning
 
-Graceful shutdown coordinates three timeout parameters to drain in-flight requests and session bridge connections:
+Graceful shutdown coordinates one application drain deadline plus a Kubernetes hard deadline:
+The owning requirements live in the
+[deployment-installation OpenSpec capability](../../../openspec/specs/deployment-installation/).
 
 ```
-preStopSleepSeconds (15s minimum) → shutdownDrainTimeoutSeconds (30s) → terminationGracePeriodSeconds (60s)
+preStop starts shared config.shutdownDrainTimeoutSeconds (30s)
+├─ preStopSleepSeconds routing dwell (15s default)
+└─ in-flight drain until zero or the shared deadline
+terminationGracePeriodSeconds (65s) bounds preStop, SIGTERM, and final cleanup
 ```
 
 **Timeline:**
 
-1. **preStopSleepSeconds (15s minimum)**: Pod enters preStop
+1. **preStop / preStopSleepSeconds (15s default)**: Pod termination begins
    - Calls `/internal/drain/start` so readiness fails and new app requests are rejected
-   - Polls `/internal/drain/status` during the wait so in-flight state is visible while draining
-   - Gives Kubernetes/load balancers time to remove the pod from rotation before SIGTERM
+   - When the Python helper starts, it establishes the routing-dwell clock and sends that helper-anchored monotonic deadline to the loopback endpoint; that deadline-bearing call commits the one-way shutdown barrier
+   - The app clamps the deadline to its configured timeout and returns the effective absolute deadline for the hook to reuse
+   - Starts the same `config.shutdownDrainTimeoutSeconds` deadline later reused by SIGTERM
+   - Measures routing dwell from Python helper start; the local start request consumes that same budget
+   - Polls `/internal/drain/status`, then exits after dwell when `in_flight=0`
+   - On start/status failure, exits promptly so SIGTERM becomes the fallback
    
-2. **shutdownDrainTimeoutSeconds (30s)**: Drain in-flight requests
-   - HTTP server stops accepting new connections
-   - Any remaining requests are allowed to complete (up to 30 seconds)
-   - Session bridge connections are gracefully closed
+2. **SIGTERM / remaining shared drain budget**:
+   - Does not restart or extend the deadline established by preStop
+   - Stops accepting new HTTP and WebSocket work
+   - Lets admitted Responses turns finish terminal delivery, persistence, and settlement within the remaining budget
    
-3. **terminationGracePeriodSeconds (60s)**: Hard deadline
-   - Total time from SIGTERM to SIGKILL
-   - Must be ≥ `preStopSleepSeconds + shutdownDrainTimeoutSeconds`
-   - Default 60s allows 15s + 30s + 15s buffer
+3. **terminationGracePeriodSeconds (65s default)**: Hard deadline
+   - Starts before the preStop helper process and covers helper launch, preStop, SIGTERM, and final process cleanup before SIGKILL
+   - Must be ≥ `config.shutdownDrainTimeoutSeconds + 32`
+   - After the helper starts, the extra two seconds cover a failed local drain-start request before direct SIGTERM starts the application budget
+   - After the application deadline, the launcher stops awaiting Uvicorn connection or lifespan cleanup after a further 25 seconds; if cleanup remains cancellation-resistant, it forces the captured signal (or SIGTERM for programmatic shutdown), while the remaining five seconds cover signal delivery and ordinary process exit
+   - Kubelet's exec/Python launch latency is outside the application's control and consumes only this hard grace, not the application budget. Production overrides should retain headroom above the minimum; the 65-second default includes three additional seconds
+   - This post-drain phase is not a second request-drain period
 
 **Tuning:**
 
-- Increase `preStopSleepSeconds` if your load balancer takes longer to deregister or short requests need a larger pre-SIGTERM drain window
-- Increase `shutdownDrainTimeoutSeconds` if requests typically take >30s to complete
-- Increase `terminationGracePeriodSeconds` proportionally (must be larger than the sum)
-- Keep the buffer small; long shutdown times delay pod replacement
+- Keep `preStopSleepSeconds <= config.shutdownDrainTimeoutSeconds`
+- Increase `preStopSleepSeconds` if your load balancer takes longer to deregister
+- Increase `config.shutdownDrainTimeoutSeconds` if requests typically take >30s to complete
+- Preserve the fixed 32-second start-fallback and post-drain reserve when changing `terminationGracePeriodSeconds`
+- Run one worker per pod/container and scale with replicas; the owned launcher pins one worker and ignores ambient `WEB_CONCURRENCY`
 
 Example for long-running requests:
 
 ```yaml
 preStopSleepSeconds: 20
-shutdownDrainTimeoutSeconds: 60
-terminationGracePeriodSeconds: 90
+config:
+  shutdownDrainTimeoutSeconds: 60
+terminationGracePeriodSeconds: 95
 ```
 
 ### Scale-Down Caution
@@ -499,7 +551,46 @@ gatewayApi:
       namespace: gateway-system
   hostnames:
     - codex-lb.example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1
+        - path:
+            type: PathPrefix
+            value: /backend-api/codex
+        - path:
+            type: PathPrefix
+            value: /backend-api/wham
+        - path:
+            type: PathPrefix
+            value: /backend-api/transcribe
+        - path:
+            type: PathPrefix
+            value: /backend-api/files
+        - path:
+            type: PathPrefix
+            value: /api/codex
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: traefik.io
+            kind: Middleware
+            name: oauth-forward-auth
 ```
+
+When `rules` is empty, the chart renders the existing catch-all route. For
+custom rules, the chart preserves their order and adds the codex-lb Service as
+the backend of every rule. Referenced extension resources must be valid for the
+HTTPRoute namespace according to the selected Gateway implementation.
+
+For application-specific Gateway setup, see the
+[Kubernetes deployment guide](../../../docs/deployment/kubernetes.md#application-specific-gateway)
+and the [owning OpenSpec change](../../../openspec/changes/create-application-gateway/).
 
 ### nginx annotations and responses sticky routing
 
@@ -523,6 +614,19 @@ Advanced snippet-based keys via `ingress.responses.nginx.configurationSnippet` a
 ```bash
 helm upgrade codex-lb oci://ghcr.io/soju06/charts/codex-lb <your values...>
 ```
+
+**Upgrade warning:** this release adds a render-time timing guard. Existing
+values files, `--set` overrides, or values retained by
+`helm upgrade --reuse-values` with
+`terminationGracePeriodSeconds < config.shutdownDrainTimeoutSeconds + 32`
+make `helm template`, `helm install`, and `helm upgrade` fail before resources
+are applied. With the default `config.shutdownDrainTimeoutSeconds: 30`, the
+minimum is `62`; the chart default is `65`. Raise every retained low value
+explicitly to at least the computed minimum (`65` preserves the chart's default
+headroom for a 30-second drain). Omitting the key does not clear its stored
+value when `--reuse-values` is used. To adopt the chart default instead, use an
+intentional non-reuse or `--reset-values` upgrade with the key absent. Production
+overrides should retain additional helper-launch headroom.
 
 - External DB installs can migrate before StatefulSet creation.
 - External secrets installs keep the dedicated migration Job and fail closed behind the schema gate.

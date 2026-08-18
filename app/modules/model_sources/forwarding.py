@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from json import JSONDecodeError
+from math import isfinite
 from typing import cast
 
 import aiohttp
+import anyio
 
 from app.core.clients.http import lease_http_session
 from app.core.crypto import TokenEncryptor
@@ -40,9 +43,25 @@ class SourceUsage:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceTimings:
+    """Server-reported generation timing, for TTFT/tokens-per-second reporting.
+
+    Maps directly onto ``RequestLog.latency_first_token_ms`` /
+    ``RequestLog.latency_ms`` so source-routed requests get the same TTFT and
+    tokens-per-second dashboard reporting as subscription-backed ones, sourced
+    from the upstream's own measurements rather than proxy-side timers (the
+    proxy does not instrument source forwarding round trips itself).
+    """
+
+    latency_first_token_ms: int
+    latency_ms: int
+
+
+@dataclass(frozen=True, slots=True)
 class SourceChatCompletion:
     payload: dict[str, JsonValue]
     usage: SourceUsage | None
+    timings: SourceTimings | None
     upstream_status_code: int
 
 
@@ -50,6 +69,7 @@ class SourceChatCompletion:
 class SourceResponsesCompletion:
     payload: dict[str, JsonValue]
     usage: SourceUsage | None
+    timings: SourceTimings | None
     upstream_status_code: int
 
 
@@ -59,6 +79,7 @@ class SourceAudioTranscription:
     content_type: str | None
     usage: SourceUsage | None
     audio_seconds: float | None
+    timings: SourceTimings | None
     upstream_status_code: int
 
 
@@ -79,6 +100,37 @@ class SourceResponsesStream:
 @dataclass(slots=True)
 class SourceUsageHolder:
     usage: SourceUsage | None = None
+    timings: SourceTimings | None = None
+
+
+async def _await_cleanup_deferring_cancellation(awaitable: Awaitable[object]) -> None:
+    """Finish owned upstream cleanup even if the caller is cancelled again."""
+
+    task = asyncio.ensure_future(awaitable)
+    with anyio.CancelScope(shield=True):
+        while True:
+            try:
+                await asyncio.shield(task)
+                return
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    raise
+
+
+async def _await_result_deferring_cancellation(awaitable: Awaitable[object]) -> bool:
+    """Finish owned cleanup and report whether cancellation arrived mid-flight."""
+
+    task = asyncio.ensure_future(awaitable)
+    cancellation_deferred = False
+    with anyio.CancelScope(shield=True):
+        while True:
+            try:
+                await asyncio.shield(task)
+                return cancellation_deferred
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    raise
+                cancellation_deferred = True
 
 
 async def forward_chat_completion(
@@ -87,35 +139,48 @@ async def forward_chat_completion(
     *,
     encryptor: TokenEncryptor | None = None,
 ) -> SourceChatCompletion:
+    stack = AsyncExitStack()
     try:
-        async with lease_http_session() as session:
-            timeout = aiohttp.ClientTimeout(total=_source_timeout_seconds(source))
-            async with session.post(
+        session = await stack.enter_async_context(lease_http_session())
+        timeout = aiohttp.ClientTimeout(total=_source_timeout_seconds(source))
+        response = await stack.enter_async_context(
+            session.post(
                 _source_url(source, "/chat/completions"),
                 headers=_source_headers(source, encryptor=encryptor),
                 json=payload,
                 timeout=timeout,
-            ) as response:
-                data = await _response_json(response)
-                if response.status >= 400:
-                    raise ModelSourceForwardingError(
-                        status_code=response.status,
-                        payload=_redact_source_error_payload(
-                            _error_payload(data),
-                            source,
-                            encryptor=encryptor,
-                        ),
-                        upstream_status_code=response.status,
-                    )
-                if data is None:
-                    raise _invalid_upstream_response_error(response.status)
-                return SourceChatCompletion(
-                    payload=data,
-                    usage=_usage_from_chat_payload(data),
-                    upstream_status_code=response.status,
-                )
+            )
+        )
+        data = await _response_json(response)
+        if response.status >= 400:
+            raise ModelSourceForwardingError(
+                status_code=response.status,
+                payload=_redact_source_error_payload(
+                    _error_payload(data),
+                    source,
+                    encryptor=encryptor,
+                ),
+                upstream_status_code=response.status,
+            )
+        if data is None:
+            raise _invalid_upstream_response_error(response.status)
+        result = SourceChatCompletion(
+            payload=data,
+            usage=_usage_from_chat_payload(data),
+            timings=_timings_from_payload(data),
+            upstream_status_code=response.status,
+        )
     except (aiohttp.ClientError, TimeoutError) as exc:
+        await _await_cleanup_deferring_cancellation(stack.aclose())
         raise _unreachable_error(exc) from exc
+    except BaseException:
+        await _await_cleanup_deferring_cancellation(stack.aclose())
+        raise
+
+    cleanup_cancelled = await _await_result_deferring_cancellation(stack.aclose())
+    if cleanup_cancelled:
+        raise asyncio.CancelledError
+    return result
 
 
 async def stream_chat_completion(
@@ -129,10 +194,15 @@ async def stream_chat_completion(
     stack, response = await _open_source_stream(source, "/chat/completions", payload, encryptor=encryptor)
 
     async def body() -> AsyncIterator[bytes]:
-        async with stack:
+        try:
             async for chunk in response.content.iter_chunked(4096):
                 usage_parser.feed(chunk)
                 yield chunk
+        finally:
+            # A plain ``async with stack`` unwinds unshielded: repeated
+            # cancellation delivery can interrupt ``__aexit__`` mid-unwind and
+            # leak the pooled HTTP session lease.
+            await _await_cleanup_deferring_cancellation(stack.aclose())
 
     return SourceChatStream(body=body(), usage_holder=usage_holder, upstream_status_code=response.status)
 
@@ -168,6 +238,7 @@ async def forward_responses(
                 return SourceResponsesCompletion(
                     payload=data,
                     usage=_usage_from_responses_payload(data),
+                    timings=_timings_from_payload(data),
                     upstream_status_code=response.status,
                 )
     except (aiohttp.ClientError, TimeoutError) as exc:
@@ -220,6 +291,7 @@ async def forward_audio_transcription(
                     content_type=response_content_type,
                     usage=_usage_from_audio_body(body, response_content_type),
                     audio_seconds=_audio_seconds_from_body(body, response_content_type),
+                    timings=_timings_from_audio_body(body, response_content_type),
                     upstream_status_code=response.status,
                 )
     except (aiohttp.ClientError, TimeoutError) as exc:
@@ -237,10 +309,15 @@ async def stream_responses(
     stack, response = await _open_source_stream(source, "/responses", payload, encryptor=encryptor)
 
     async def body() -> AsyncIterator[bytes]:
-        async with stack:
+        try:
             async for chunk in response.content.iter_chunked(4096):
                 usage_parser.feed(chunk)
                 yield chunk
+        finally:
+            # A plain ``async with stack`` unwinds unshielded: repeated
+            # cancellation delivery can interrupt ``__aexit__`` mid-unwind and
+            # leak the pooled HTTP session lease.
+            await _await_cleanup_deferring_cancellation(stack.aclose())
 
     return SourceResponsesStream(body=body(), usage_holder=usage_holder, upstream_status_code=response.status)
 
@@ -286,10 +363,10 @@ async def _open_source_stream(
             )
         return stack, response
     except (aiohttp.ClientError, TimeoutError) as exc:
-        await stack.aclose()
+        await _await_cleanup_deferring_cancellation(stack.aclose())
         raise _unreachable_error(exc) from exc
     except BaseException:
-        await stack.aclose()
+        await _await_cleanup_deferring_cancellation(stack.aclose())
         raise
 
 
@@ -504,6 +581,53 @@ def _audio_seconds_from_body(body: bytes, content_type: str | None) -> float | N
     return seconds if seconds > 0 else None
 
 
+def _timings_from_payload(payload: Mapping[str, JsonValue]) -> SourceTimings | None:
+    metrics = payload.get("metrics")
+    if not is_json_mapping(metrics):
+        return None
+    return _timings_from_metrics(metrics)
+
+
+def _timings_from_audio_body(body: bytes, content_type: str | None) -> SourceTimings | None:
+    if not _is_json_content_type(content_type):
+        return None
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, JSONDecodeError):
+        return None
+    if not is_json_mapping(parsed):
+        return None
+    return _timings_from_payload(parsed)
+
+
+def _timings_from_metrics(metrics: Mapping[str, JsonValue]) -> SourceTimings | None:
+    """Parse vLLM-style per-request timing metrics into ``SourceTimings``.
+
+    vLLM's OpenAI-compatible server (and compatible forks) can attach a
+    ``metrics`` object alongside ``usage`` with ``time_to_first_token_ms``
+    (TTFT) and ``generation_time_ms`` (wall-clock time to produce the
+    completion tokens *after* the first token). Storing their sum as
+    ``latency_ms`` alongside ``latency_first_token_ms`` lets the existing
+    dashboard TPS calculation use ``generation_time_ms`` as its denominator,
+    preserving the generation-only throughput semantics used for
+    subscription-backed requests.
+    """
+    ttft = metrics.get("time_to_first_token_ms")
+    generation = metrics.get("generation_time_ms")
+    if isinstance(ttft, bool) or not isinstance(ttft, (int, float)):
+        return None
+    if isinstance(generation, bool) or not isinstance(generation, (int, float)):
+        return None
+    if (isinstance(ttft, float) and not isfinite(ttft)) or (isinstance(generation, float) and not isfinite(generation)):
+        return None
+    if ttft < 0 or generation < 0:
+        return None
+    return SourceTimings(
+        latency_first_token_ms=round(ttft),
+        latency_ms=round(ttft + generation),
+    )
+
+
 def _usage_from_mapping(usage: Mapping[str, JsonValue]) -> SourceUsage | None:
     prompt_tokens = usage.get("prompt_tokens")
     completion_tokens = usage.get("completion_tokens")
@@ -597,10 +721,14 @@ class SourceStreamUsageParser:
                 continue
             if self._response_shape == "responses":
                 usage = _usage_from_responses_event(parsed)
+                timings = _timings_from_responses_event(parsed)
             else:
                 usage = _usage_from_chat_payload(parsed)
+                timings = _timings_from_payload(parsed)
             if usage is not None:
                 self._usage_holder.usage = usage
+            if timings is not None:
+                self._usage_holder.timings = timings
 
 
 def _usage_from_responses_event(payload: Mapping[str, JsonValue]) -> SourceUsage | None:
@@ -609,6 +737,14 @@ def _usage_from_responses_event(payload: Mapping[str, JsonValue]) -> SourceUsage
     if usage is None:
         usage = _usage_from_responses_payload(payload)
     return usage
+
+
+def _timings_from_responses_event(payload: Mapping[str, JsonValue]) -> SourceTimings | None:
+    response = payload.get("response")
+    timings = _timings_from_payload(response) if is_json_mapping(response) else None
+    if timings is None:
+        timings = _timings_from_payload(payload)
+    return timings
 
 
 def _capture_stream_usage(chunk: bytes, usage_holder: SourceUsageHolder) -> None:

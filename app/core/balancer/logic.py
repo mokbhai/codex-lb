@@ -51,6 +51,8 @@ REAUTH_REQUIRED_FAILURE_CODES = frozenset(
 SECONDS_PER_DAY = 60 * 60 * 24
 SECONDS_PER_HOUR = 60 * 60
 SECONDS_PER_WEEK = 7 * SECONDS_PER_DAY
+RATE_LIMIT_RESET_MAX_HORIZON_SECONDS = 366 * SECONDS_PER_DAY
+RATE_LIMIT_RESET_ROUNDING_TOLERANCE_SECONDS = 1.0
 UNKNOWN_RESET_BUCKET_DAYS = 10_000
 UNKNOWN_RESET_FALLBACK_SECONDS = 7 * SECONDS_PER_DAY
 RELATIVE_AVAILABILITY_MIN_DIVISOR_SECONDS = 5 * 60
@@ -89,6 +91,7 @@ DRAIN_PRIMARY_THRESHOLD_PCT = 85.0
 DRAIN_SECONDARY_THRESHOLD_PCT = 90.0
 DRAIN_ERROR_WINDOW_SECONDS = 60.0
 DRAIN_ERROR_COUNT_THRESHOLD = 2
+ERROR_BACKOFF_THRESHOLD = 3
 PROBE_QUIET_SECONDS = 60.0
 PROBE_SUCCESS_STREAK_REQUIRED = 3
 ROUTING_POLICY_NORMAL = "normal"
@@ -143,6 +146,90 @@ class AccountState:
 class SelectionResult:
     account: AccountState | None
     error_message: str | None
+    error_code: str | None = None
+    resets_at: int | None = None
+
+
+USAGE_LIMIT_REACHED = "usage_limit_reached"
+
+
+def pool_usage_exhaustion(
+    states: Iterable[AccountState],
+    *,
+    current: float,
+    ignore_standard_quota: bool = False,
+    ignore_standard_quota_account_ids: Collection[str] | None = None,
+) -> SelectionResult | None:
+    """Describe pool-wide subscription exhaustion without parsing retry text."""
+    if ignore_standard_quota:
+        return None
+    ignored_account_ids = set(ignore_standard_quota_account_ids or ())
+
+    def _primary_usage_evidence(state: AccountState) -> float | None:
+        return state.priority_used_percent if state.priority_used_percent is not None else state.used_percent
+
+    def _secondary_usage_evidence(state: AccountState) -> float | None:
+        if state.limit_scoped_usage and state.priority_secondary_used_percent is None:
+            return _primary_usage_evidence(state)
+        return (
+            state.priority_secondary_used_percent
+            if state.priority_secondary_used_percent is not None
+            else state.secondary_used_percent
+        )
+
+    def _usage_exhausted(state: AccountState) -> bool:
+        if state.status not in (AccountStatus.QUOTA_EXCEEDED, AccountStatus.RATE_LIMITED):
+            return False
+        usage_values = (_primary_usage_evidence(state), _secondary_usage_evidence(state))
+        return any(value is not None and float(value) >= 100.0 for value in usage_values)
+
+    def _usage_exhausted_reset_at(state: AccountState) -> float | None:
+        if state.status not in (AccountStatus.QUOTA_EXCEEDED, AccountStatus.RATE_LIMITED):
+            return None
+        candidates: list[float] = []
+        primary_evidence = _primary_usage_evidence(state)
+        secondary_evidence = _secondary_usage_evidence(state)
+        if primary_evidence is not None and float(primary_evidence) >= 100.0 and state.primary_reset_at is not None:
+            candidates.append(float(state.primary_reset_at))
+        if (
+            secondary_evidence is not None
+            and float(secondary_evidence) >= 100.0
+            and state.secondary_reset_at is not None
+        ):
+            candidates.append(float(state.secondary_reset_at))
+        if not candidates:
+            return None
+        return max(candidates)
+
+    eligible = [
+        state
+        for state in states
+        if not state.ignore_standard_quota
+        and state.account_id not in ignored_account_ids
+        and state.status
+        not in (
+            AccountStatus.PAUSED,
+            AccountStatus.REAUTH_REQUIRED,
+            AccountStatus.DEACTIVATED,
+        )
+    ]
+    if not eligible or any(not _usage_exhausted(state) for state in eligible):
+        return None
+
+    # Only usage-proven exhausted accounts reach this branch; surface the
+    # earliest reset for an actually exhausted window so the structured 429
+    # does not retry a secondary-window exhaustion at the primary reset time.
+    reset_candidates = [reset_at for state in eligible if (reset_at := _usage_exhausted_reset_at(state)) is not None]
+    resets_at = int(min(reset_candidates)) if reset_candidates else None
+    message = "Usage limit reached"
+    if resets_at is not None:
+        message = _format_retry_hint(max(0.0, resets_at - current))
+    return SelectionResult(
+        account=None,
+        error_message=message,
+        error_code=USAGE_LIMIT_REACHED,
+        resets_at=resets_at,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,6 +453,7 @@ def select_account(
     routing_strategy: RoutingStrategy = "capacity_weighted",
     allow_backoff_fallback: bool = True,
     deterministic_probe: bool = False,
+    recovery_probe_only: bool = False,
     relative_availability_power: float = DEFAULT_RELATIVE_AVAILABILITY_POWER,
     relative_availability_top_k: int = DEFAULT_RELATIVE_AVAILABILITY_TOP_K,
     usage_weighted_order: UsageWeightedOrder = "secondary_first",
@@ -376,6 +464,8 @@ def select_account(
     primary_first_usage_weighted: bool = False,
     routing_costs: RoutingCostsByAccount | None = None,
     replica_salt: str | None = None,
+    allow_usage_exhaustion_error: bool = True,
+    usage_exhaustion_states: Iterable[AccountState] | None = None,
 ) -> SelectionResult:
     """Select an eligible account by applying availability checks and routing strategy.
 
@@ -403,6 +493,9 @@ def select_account(
             account exists.
         deterministic_probe: Whether weighted strategies should use a
             deterministic probe order instead of random weighted choice.
+        recovery_probe_only: Whether to return only a due probing-account
+            recovery admission and otherwise return no selection. Health-tier
+            bypass strategies ignore this internal mode.
         relative_availability_power: Exponent applied to normalized relative
             availability weights.
         relative_availability_top_k: Maximum number of highest-weight
@@ -440,6 +533,7 @@ def select_account(
     available: list[AccountState] = []
     in_error_backoff: list[AccountState] = []
     all_states = list(states)
+    usage_exhaustion_state_list = list(usage_exhaustion_states) if usage_exhaustion_states is not None else all_states
     bypass_account_ids = None if bypass_quota_exceeded_account_ids is None else set(bypass_quota_exceeded_account_ids)
 
     for state in all_states:
@@ -475,8 +569,8 @@ def select_account(
             state.error_count = 0
         if state.cooldown_until and current < state.cooldown_until:
             continue
-        if state.error_count >= 3:
-            backoff = min(300, 30 * (2 ** (state.error_count - 3)))
+        if state.error_count >= ERROR_BACKOFF_THRESHOLD:
+            backoff = min(300, 30 * (2 ** (state.error_count - ERROR_BACKOFF_THRESHOLD)))
             if state.last_error_at and current - state.last_error_at < backoff:
                 in_error_backoff.append(state)
                 continue
@@ -513,7 +607,7 @@ def select_account(
         if allow_backoff_fallback and (len(in_error_backoff) > 1 or (in_error_backoff and hard_blocked_exists)):
 
             def _backoff_expires_at(s: AccountState) -> float:
-                backoff = min(300, 30 * (2 ** (s.error_count - 3)))
+                backoff = min(300, 30 * (2 ** (s.error_count - ERROR_BACKOFF_THRESHOLD)))
                 return (s.last_error_at or 0.0) + backoff
 
             available.append(min(in_error_backoff, key=_backoff_expires_at))
@@ -523,6 +617,15 @@ def select_account(
                     return SelectionResult(None, f"opportunistic burn window closed: {reason}")
                 available = opportunistic_available
         else:
+            if allow_usage_exhaustion_error:
+                usage_exhaustion = pool_usage_exhaustion(
+                    usage_exhaustion_state_list,
+                    current=current,
+                    ignore_standard_quota=ignore_standard_quota or bypass_quota_exceeded,
+                    ignore_standard_quota_account_ids=bypass_account_ids,
+                )
+                if usage_exhaustion is not None:
+                    return usage_exhaustion
             reauth_required = [s for s in all_states if s.status == AccountStatus.REAUTH_REQUIRED]
             deactivated = [s for s in all_states if s.status == AccountStatus.DEACTIVATED]
             paused = [s for s in all_states if s.status == AccountStatus.PAUSED]
@@ -615,7 +718,13 @@ def select_account(
     healthy = [s for s in available if s.health_tier == HEALTH_TIER_HEALTHY]
     probing = [s for s in available if s.health_tier == HEALTH_TIER_PROBING]
     draining = [s for s in available if s.health_tier == HEALTH_TIER_DRAINING]
-    health_pool = healthy or probing or draining or available
+    # Recovery is a liveness admission inside the already-eligible pool. Pick
+    # it before routing-policy preferences so burn/preserve policy cannot make
+    # PROBING permanent, but never before quota/cooldown/security filtering.
+    due_probe = _oldest_due_probing_account(probing, current=current) if healthy or recovery_probe_only else None
+    if recovery_probe_only and due_probe is None:
+        return SelectionResult(None, None)
+    health_pool = [due_probe] if due_probe is not None else healthy or probing or draining or available
     burn_first = [s for s in health_pool if _routing_policy(s) == ROUTING_POLICY_BURN_FIRST]
     normal = [s for s in health_pool if _routing_policy(s) == ROUTING_POLICY_NORMAL]
     preserve = [s for s in health_pool if _routing_policy(s) == ROUTING_POLICY_PRESERVE]
@@ -670,6 +779,27 @@ def select_account(
                 key=_reset_first_sort_key if effective_prefer_earlier_reset else _usage_sort_key_with_cost,
             )
     return SelectionResult(selected, None)
+
+
+def _oldest_due_probing_account(
+    probing: Iterable[AccountState],
+    *,
+    current: float,
+) -> AccountState | None:
+    due = [
+        state
+        for state in probing
+        if state.last_selected_at is None or current - state.last_selected_at >= PROBE_QUIET_SECONDS
+    ]
+    if not due:
+        return None
+    return min(
+        due,
+        key=lambda state: (
+            state.last_selected_at if state.last_selected_at is not None else float("-inf"),
+            state.account_id,
+        ),
+    )
 
 
 def _remaining_secondary_credits(state: AccountState) -> float:
@@ -1077,7 +1207,7 @@ def handle_rate_limit(state: AccountState, error: UpstreamError) -> None:
     state.last_error_at = now
     state.blocked_at = now
 
-    reset_at = _extract_reset_at(error)
+    reset_at = _extract_reset_at(error, now=now)
 
     message = error.get("message")
     delay = parse_retry_after(message) if message else None
@@ -1123,16 +1253,17 @@ def _format_retry_hint(wait_seconds: float) -> str:
 
 
 def handle_quota_exceeded(state: AccountState, error: UpstreamError) -> None:
+    now = time.time()
     state.status = AccountStatus.QUOTA_EXCEEDED
     state.used_percent = 100.0
-    state.blocked_at = time.time()
-    state.cooldown_until = time.time() + QUOTA_EXCEEDED_COOLDOWN_SECONDS
+    state.blocked_at = now
+    state.cooldown_until = now + QUOTA_EXCEEDED_COOLDOWN_SECONDS
 
-    reset_at = _extract_reset_at(error)
+    reset_at = _extract_reset_at(error, now=now)
     if reset_at is not None:
         state.reset_at = reset_at
     else:
-        state.reset_at = int(time.time() + 3600)
+        state.reset_at = int(now + 3600)
 
 
 def handle_permanent_failure(state: AccountState, error_code: str) -> None:
@@ -1168,13 +1299,53 @@ def failover_decision(
     return "surface"
 
 
-def _extract_reset_at(error: UpstreamError) -> int | None:
-    reset_at = error.get("resets_at")
+def plausible_rate_limit_reset_at(
+    reset_at: int | float | None,
+    *,
+    now: float | None = None,
+    allow_rounding_slack: bool = True,
+) -> float | None:
+    """Return a finite near-future reset deadline, or ``None`` when invalid."""
+
+    if reset_at is None or isinstance(reset_at, bool):
+        return None
+    current = time.time() if now is None else now
+    if isinstance(reset_at, float) and not math.isfinite(reset_at):
+        return None
+    horizon = RATE_LIMIT_RESET_MAX_HORIZON_SECONDS
+    if allow_rounding_slack:
+        # Persisted deadlines are whole seconds; ceil may move an otherwise
+        # valid raw deadline just beyond the metadata horizon.
+        horizon += RATE_LIMIT_RESET_ROUNDING_TOLERANCE_SECONDS
+    # Keep this comparison ahead of float conversion: Python integers can be
+    # arbitrarily large, while converting malformed metadata can overflow.
+    if reset_at <= current or reset_at > current + horizon:
+        return None
+    return float(reset_at)
+
+
+def _extract_reset_at(error: UpstreamError, *, now: float) -> int | None:
+    reset_at = plausible_rate_limit_reset_at(
+        error.get("resets_at"),
+        now=now,
+        allow_rounding_slack=False,
+    )
     if reset_at is not None:
-        return int(reset_at)
+        rounded_reset_at = int(math.ceil(reset_at))
+        if plausible_rate_limit_reset_at(rounded_reset_at, now=now) is not None:
+            return rounded_reset_at
+        return None
+
     reset_in = error.get("resets_in_seconds")
-    if reset_in is not None:
-        return int(time.time() + float(reset_in))
+    if reset_in is None or isinstance(reset_in, bool):
+        return None
+    if isinstance(reset_in, float) and not math.isfinite(reset_in):
+        return None
+    if reset_in <= 0 or reset_in > RATE_LIMIT_RESET_MAX_HORIZON_SECONDS:
+        return None
+    rounded_reset_at = int(math.ceil(now + float(reset_in)))
+    if plausible_rate_limit_reset_at(rounded_reset_at, now=now) is not None:
+        return rounded_reset_at
     return None
 
 

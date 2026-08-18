@@ -15,7 +15,7 @@ from app.core.clients.proxy import ProxyResponseError, filter_inbound_headers
 from app.core.config.settings import get_settings
 from app.core.crypto import get_or_create_key
 from app.core.errors import OpenAIErrorEnvelope, openai_error, response_failed_event
-from app.core.openai.requests import ResponsesRequest
+from app.core.openai.requests import ResponsesRequest, extract_input_file_ids
 from app.core.types import JsonObject
 from app.core.utils.json_guards import is_json_mapping
 from app.core.utils.request_id import get_request_id
@@ -55,6 +55,7 @@ HTTP_BRIDGE_RESERVATION_KEY_ID_HEADER = "x-codex-bridge-reservation-key-id"
 HTTP_BRIDGE_RESERVATION_MODEL_HEADER = "x-codex-bridge-reservation-model"
 HTTP_BRIDGE_AFFINITY_KIND_HEADER = "x-codex-bridge-affinity-kind"
 HTTP_BRIDGE_AFFINITY_KEY_HEADER = "x-codex-bridge-affinity-key"
+HTTP_BRIDGE_FILE_OWNER_HEADER = "x-codex-bridge-file-owner"
 HTTP_BRIDGE_ORIGINAL_UNANCHORED_HEADER = "x-codex-bridge-original-unanchored"
 HTTP_BRIDGE_SIGNATURE_VERSION_HEADER = "x-codex-bridge-signature-version"
 HTTP_BRIDGE_CLIENT_IP_HEADER = "x-codex-bridge-client-ip"
@@ -83,6 +84,7 @@ class HTTPBridgeForwardContext:
     original_request_unanchored: bool = False
     original_affinity_kind: str | None = None
     original_affinity_key: str | None = None
+    file_owner_account_id: str | None = None
     client_ip: str | None = None
     reservation: ApiKeyUsageReservationData | None = None
     signature_version: str | None = None
@@ -121,6 +123,9 @@ class HTTPBridgeOwnerClient:
         headers: Mapping[str, str],
         context: HTTPBridgeForwardContext,
         request_started_at: float,
+        on_request_dispatched: Callable[[], None] | None = None,
+        on_response_rejected: Callable[[], None] | None = None,
+        on_response_wait: Callable[[], None] | None = None,
         on_response_ready: Callable[[], None] | None = None,
     ) -> AsyncIterator[str]:
         settings = get_settings()
@@ -128,52 +133,82 @@ class HTTPBridgeOwnerClient:
             connect_timeout_seconds=settings.upstream_connect_timeout_seconds,
             idle_timeout_seconds=settings.stream_idle_timeout_seconds,
         )
+        if on_response_wait is not None:
+            on_response_wait()
         async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as session:
-            async with session.post(
-                f"{owner_endpoint}{HTTP_BRIDGE_INTERNAL_FORWARD_PATH}",
-                json=payload.model_dump_for_forwarding(),
-                headers=build_owner_forward_headers(headers=headers, payload=payload, context=context),
+            request_url = f"{owner_endpoint}{HTTP_BRIDGE_INTERNAL_FORWARD_PATH}"
+            request_payload = payload.model_dump_for_forwarding()
+            request_headers = build_owner_forward_headers(headers=headers, payload=payload, context=context)
+            request_context = session.post(
+                request_url,
+                json=request_payload,
+                headers=request_headers,
                 skip_auto_headers=_OWNER_FORWARD_SKIP_AUTO_HEADERS,
-            ) as response:
-                if response.status != 200:
-                    payload_text = await response.text()
-                    raise ProxyResponseError(
-                        response.status,
-                        _owner_forward_error_payload(status_code=response.status, payload_text=payload_text),
-                        failure_phase="owner_forward_status",
-                        failure_detail="owner_forward_non_200",
-                        upstream_status_code=response.status,
-                    )
-                if on_response_ready is not None:
-                    on_response_ready()
-                yielded_event = False
-                try:
-                    async for event_block in _iter_sse_event_blocks(
-                        response,
-                        request_started_at=request_started_at,
-                        proxy_request_budget_seconds=_http_bridge_request_budget_seconds(settings),
-                        stream_idle_timeout_seconds=settings.stream_idle_timeout_seconds,
-                    ):
-                        yielded_event = True
-                        yield event_block
-                except _OwnerForwardStreamTimeoutError as exc:
-                    raise OwnerForwardRelayFailure(
-                        format_sse_event(
+            )
+            # I/O begins when __aenter__ is awaited. Cancellation after that
+            # point can leave the receiver settling the reservation.
+            transport_started = False
+            observed_status = False
+            try:
+                transport_started = True
+                async with request_context as response:
+                    observed_status = True
+                    if response.status != 200:
+                        if on_response_rejected is not None:
+                            # The receiver contract never transfers cleanup on a
+                            # non-200 response, so the origin may safely release.
+                            on_response_rejected()
+                        payload_text = await response.text()
+                        raise ProxyResponseError(
+                            response.status,
+                            _owner_forward_error_payload(status_code=response.status, payload_text=payload_text),
+                            failure_phase="owner_forward_status",
+                            failure_detail="owner_forward_non_200",
+                            upstream_status_code=response.status,
+                        )
+                    if on_response_ready is not None:
+                        on_response_ready()
+                    yielded_event = False
+                    try:
+                        async for event_block in _iter_sse_event_blocks(
+                            response,
+                            request_started_at=request_started_at,
+                            proxy_request_budget_seconds=_http_bridge_request_budget_seconds(settings),
+                            stream_idle_timeout_seconds=settings.stream_idle_timeout_seconds,
+                        ):
+                            yielded_event = True
+                            yield event_block
+                    except _OwnerForwardStreamTimeoutError as exc:
+                        raise OwnerForwardRelayFailure(
+                            format_sse_event(
+                                response_failed_event(
+                                    exc.error_code,
+                                    exc.error_message,
+                                    response_id=get_request_id(),
+                                )
+                            )
+                        )
+                    if not yielded_event:
+                        yield format_sse_event(
                             response_failed_event(
-                                exc.error_code,
-                                exc.error_message,
+                                "stream_incomplete",
+                                "Upstream websocket closed before response.completed",
                                 response_id=get_request_id(),
                             )
                         )
-                    )
-                if not yielded_event:
-                    yield format_sse_event(
-                        response_failed_event(
-                            "stream_incomplete",
-                            "Upstream websocket closed before response.completed",
-                            response_id=get_request_id(),
-                        )
-                    )
+            except aiohttp.ClientConnectorError:
+                # DNS/connect refusal never delivered the reservation.
+                raise
+            except asyncio.CancelledError:
+                if transport_started and not observed_status and on_request_dispatched is not None:
+                    on_request_dispatched()
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                if not observed_status and on_request_dispatched is not None:
+                    # The request left local construction and may have reached
+                    # the owner; origin must not release or replay.
+                    on_request_dispatched()
+                raise
 
 
 def build_owner_forward_headers(
@@ -224,6 +259,10 @@ def build_owner_forward_headers(
     if context.original_affinity_kind and context.original_affinity_key:
         forwarded[HTTP_BRIDGE_AFFINITY_KIND_HEADER] = context.original_affinity_kind
         forwarded[HTTP_BRIDGE_AFFINITY_KEY_HEADER] = context.original_affinity_key
+    if context.file_owner_account_id:
+        # This proof is accepted only with the full-context signature below;
+        # the legacy primary signature intentionally remains byte-compatible.
+        forwarded[HTTP_BRIDGE_FILE_OWNER_HEADER] = context.file_owner_account_id
     if context.client_ip:
         forwarded[HTTP_BRIDGE_CLIENT_IP_HEADER] = context.client_ip
         forwarded[HTTP_BRIDGE_CLIENT_IP_SIGNATURE_HEADER] = _bridge_forward_signature(
@@ -307,6 +346,7 @@ def parse_forwarded_request(
         original_request_unanchored=original_request_unanchored,
         original_affinity_kind=_optional_header(headers.get(HTTP_BRIDGE_AFFINITY_KIND_HEADER)),
         original_affinity_key=_optional_header(headers.get(HTTP_BRIDGE_AFFINITY_KEY_HEADER)),
+        file_owner_account_id=_optional_header(headers.get(HTTP_BRIDGE_FILE_OWNER_HEADER)),
         client_ip=client_ip,
         reservation=_reservation_from_headers(headers),
         signature_version=signature_version,
@@ -332,6 +372,12 @@ def parse_forwarded_request(
     )
     if tools_bound_valid:
         return HTTPBridgeForwardedRequest(context=context), None
+    if context.file_owner_account_id is not None or extract_input_file_ids(payload.input):
+        # The rolling-upgrade primary signature does not bind the additive
+        # file-owner proof. Never allow a stripped/forged proof to downgrade to
+        # it, and never allow payloads with file references to fall back after a
+        # stripped proof made the owner value look absent.
+        return None, _invalid_bridge_forward_signature_error()
     # ROLLOUT SHIM (#1203, remove with HTTP_BRIDGE_SIGNATURE_V2_HEADER
     # follow-up): fall back to the primary signature (#1169's versioned /
     # legacy scheme) so owners predating the tamper-proofing header — and
@@ -550,6 +596,7 @@ def _structured_bridge_signing_payload(
             "client_ip_present": context.client_ip is not None,
             "codex_session_affinity": context.codex_session_affinity,
             "downstream_turn_state": context.downstream_turn_state,
+            "file_owner_account_id": context.file_owner_account_id,
             "include_client_ip": include_client_ip,
             "origin_instance": context.origin_instance,
             "original_affinity_key": context.original_affinity_key,

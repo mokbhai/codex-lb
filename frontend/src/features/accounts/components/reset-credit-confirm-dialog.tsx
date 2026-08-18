@@ -4,10 +4,12 @@ import {
   useRateLimitResetCredits,
 } from "@/features/accounts/hooks/use-accounts";
 import type { RateLimitResetCreditItem } from "@/features/accounts/schemas";
+import { useDateDisplayFormatStore, type DateDisplayFormat } from "@/hooks/use-date-format";
 import { cn } from "@/lib/utils";
 import { getErrorMessage } from "@/utils/errors";
-import { formatLocalDateTimeSeconds, formatSingleUnitRemaining } from "@/utils/formatters";
+import { formatDateTimeInline, formatSingleUnitRemaining } from "@/utils/formatters";
 import { useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
 
 export type ResetCreditConfirmDialogProps = {
   open: boolean;
@@ -43,11 +45,13 @@ function CreditExpiryLine({
   label,
   suffix,
   colorClass,
+  dateDisplayFormat,
 }: {
   expiresAt: string | null | undefined;
   label: string;
   suffix?: string;
   colorClass?: string;
+  dateDisplayFormat: DateDisplayFormat;
 }) {
   if (!expiresAt) {
     return <p className="text-xs text-muted-foreground">{label}{suffix ? ` ${suffix}` : ""}</p>;
@@ -56,7 +60,7 @@ function CreditExpiryLine({
   return (
     <p className="text-xs text-muted-foreground">
       {label}{" "}
-      {formatLocalDateTimeSeconds(expiresAt)}{" "}
+      {formatDateTimeInline(expiresAt, dateDisplayFormat)}{" "}
       <span
         className={cn(
           "tabular-nums",
@@ -80,6 +84,8 @@ export function ResetCreditConfirmDialog({
   accountId,
   summaryAvailableCount = 0,
 }: ResetCreditConfirmDialogProps) {
+  const { t } = useTranslation();
+  const dateDisplayFormat = useDateDisplayFormatStore((state) => state.dateDisplayFormat);
   const { resetCreditConsumeMutation } = useAccountMutations();
   const redeemRequestIdRef = useRef<string | null>(null);
   const snapshotQuery = useRateLimitResetCredits(accountId, open);
@@ -87,7 +93,7 @@ export function ResetCreditConfirmDialog({
   const snapshotError = snapshotQuery.isError;
   const snapshotErrorMessage = getErrorMessage(
     snapshotQuery.error,
-    "Failed to load reset credit details",
+    t("accounts.resetCreditDialog.loadFailed"),
   );
   const soonest = pickSoonestAvailableCredit(snapshotQuery.data?.credits);
   const otherCredits = (snapshotQuery.data?.credits ?? []).filter(
@@ -137,10 +143,10 @@ export function ResetCreditConfirmDialog({
   return (
     <ConfirmDialog
       open={open}
-      title="Redeem rate-limit reset credit"
-      description="This redeems the soonest-expiring banked reset credit for this account."
-      confirmLabel={pending ? "Redeeming..." : "Redeem credit"}
-      cancelLabel="Cancel"
+      title={t("accounts.resetCreditDialog.title")}
+      description={t("accounts.resetCreditDialog.description")}
+      confirmLabel={pending ? t("accounts.resetCreditDialog.redeeming") : t("accounts.resetCreditDialog.confirm")}
+      cancelLabel={t("common.cancel")}
       confirmDisabled={confirmDisabled}
       keepOpenOnConfirm
       onOpenChange={handleOpenChange}
@@ -148,38 +154,40 @@ export function ResetCreditConfirmDialog({
     >
       <div className="text-sm">
         {snapshotLoading ? (
-          <p className="text-xs text-muted-foreground">Loading reset credit details...</p>
+          <p className="text-xs text-muted-foreground">{t("accounts.resetCreditDialog.loading")}</p>
         ) : snapshotError ? (
           <p className="text-xs text-destructive">{snapshotErrorMessage}</p>
         ) : (
           <>
             <p className="font-medium">
-              {availableCount} free rate limit reset{availableCount !== 1 ? "s" : ""}
+              {t("accounts.resetCreditDialog.availableCount", { count: availableCount })}
             </p>
             {soonest ? (
               <div className="mt-2 space-y-1">
                 <CreditExpiryLine
                   expiresAt={soonest.expiresAt}
-                  label="Reset expires on"
-                  suffix="will be used"
+                  label={t("accounts.resetCreditDialog.resetExpiresOn")}
+                  suffix={t("accounts.resetCreditDialog.willBeUsed")}
+                  dateDisplayFormat={dateDisplayFormat}
                 />
                 {otherCredits.map((credit) => (
                   <CreditExpiryLine
                     key={credit.id}
                     expiresAt={credit.expiresAt}
-                    label="Other expires on"
+                    label={t("accounts.resetCreditDialog.otherExpiresOn")}
                     colorClass="text-muted-foreground"
+                    dateDisplayFormat={dateDisplayFormat}
                   />
                 ))}
                 {!soonest.expiresAt && otherCredits.length === 0 ? (
-                  <p className="text-xs text-muted-foreground">No upcoming expiry data available.</p>
+                  <p className="text-xs text-muted-foreground">{t("accounts.resetCreditDialog.noExpiryData")}</p>
                 ) : null}
               </div>
             ) : availableCount > 0 ? (
-              <p className="mt-1 text-xs text-muted-foreground">No upcoming expiry data available.</p>
+              <p className="mt-1 text-xs text-muted-foreground">{t("accounts.resetCreditDialog.noExpiryData")}</p>
             ) : snapshotQuery.data === null ? (
               <p className="mt-1 text-xs text-muted-foreground">
-                Reset credit details are not available yet.
+                {t("accounts.resetCreditDialog.detailsUnavailable")}
               </p>
             ) : null}
           </>

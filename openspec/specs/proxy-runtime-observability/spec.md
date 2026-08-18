@@ -153,6 +153,21 @@ When the service retires an HTTP bridge session because pending precreated repla
 - **THEN** the console log includes a HTTP bridge event with `event=retire_stale_pending`
 - **AND** the event includes only hashed bridge identity and low-cardinality metadata
 
+### Requirement: Process-wide network recovery is observable without sensitive resolver data
+
+The service MUST emit low-cardinality structured diagnostics when it detects a process-wide DNS or route failure, rotates shared transport state, retries a safe request, recovers, or exhausts the request budget. Diagnostics MUST NOT contain DNS server addresses, request payloads, API keys, access tokens, raw continuity keys, or account email addresses.
+
+#### Scenario: Recovery diagnostics are emitted
+
+- **WHEN** a safe Responses request enters and later exits process-wide network recovery
+- **THEN** logs identify the recovery stage, request id, transport, attempt count, and internal account id when known
+- **AND** logs do not expose resolver configuration or request content
+
+#### Scenario: Concurrent rotation is coalesced visibly
+
+- **WHEN** several callers report a network failure from the same shared client generation
+- **THEN** diagnostics distinguish the caller that rotated the client from callers that reused the already-rotated replacement
+
 ### Requirement: Request-log metadata keeps local routing failures unbound from upstream status
 
 When request routing fails before contacting upstream, `upstream_status_code` MUST be
@@ -169,12 +184,21 @@ analytics.
 - **AND** request-log metadata stores `upstream_status_code = null`
 
 ### Requirement: Request logs persist prompt-client user-agent metadata
-The proxy MUST persist prompt-client user-agent metadata on `request_logs` for both HTTP and WebSocket Responses traffic. Each persisted row MUST store the full inbound `User-Agent` header value when present and a derived `useragent_group` value extracted from the first product token. When the inbound header is missing or blank after trimming, both persisted values MUST be `null`.
+The proxy MUST persist prompt-client user-agent metadata on `request_logs` for both HTTP and WebSocket Responses traffic. Each persisted row MUST store the full inbound `User-Agent` header value when present and a derived `useragent_group` value. When the inbound header contains `/`, `useragent_group` MUST be the complete sequence of characters before its first `/`; when it contains no `/`, the existing group extraction behavior MUST remain unchanged. When the inbound header is missing or blank after trimming, both persisted values MUST be `null`.
+
+#### Scenario: Historical request-log user-agent families are backfilled without normalization
+- **WHEN** the user-agent family migration processes historical `request_logs` rows
+- **THEN** rows whose `useragent` is non-null and contains `/` MUST have `useragent_group` set to the exact unprocessed full prefix before the first `/`
+- **AND** rows whose `useragent` is `null` or contains no `/` MUST remain unchanged
 
 #### Scenario: HTTP request log stores user-agent metadata
 - **WHEN** an HTTP or HTTP/SSE proxy request includes `User-Agent: opencode/1.15.13 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14`
 - **THEN** the persisted `request_logs` row stores `useragent = "opencode/1.15.13 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"`
 - **AND** the persisted row stores `useragent_group = "opencode"`
+
+#### Scenario: Multi-word product family retains its full prefix
+- **WHEN** an HTTP or HTTP/SSE proxy request includes `User-Agent: Codex Desktop/0.142.4`
+- **THEN** the persisted `request_logs` row stores `useragent_group = "Codex Desktop"`
 
 #### Scenario: WebSocket request log stores user-agent metadata
 - **WHEN** a proxied WebSocket Responses session is opened with `User-Agent: opencode/1.15.13 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14`
@@ -185,6 +209,154 @@ The proxy MUST persist prompt-client user-agent metadata on `request_logs` for b
 - **WHEN** a proxied HTTP or WebSocket request omits the `User-Agent` header or sends only blank whitespace
 - **THEN** the persisted `request_logs` row stores `useragent = null`
 - **AND** the persisted row stores `useragent_group = null`
+
+### Requirement: Supported harnesses provide observational conversation metadata
+
+The proxy request-log metadata helper MUST detect a conversation ID only for
+the first matching user-agent rule in this ordered table:
+
+- `opencode` uses `x-parent-session-id`, then `x-opencode-session`, then
+  `x-session-id`, then `x-session-affinity`.
+- `codex` uses `thread-id`.
+
+User-agent prefix matching MUST ignore surrounding whitespace and case. Header
+name matching MUST be case-insensitive. The helper MUST use the first configured
+header whose value is non-empty after trimming surrounding whitespace, and MUST
+preserve the remaining conversation ID exactly. Detection MUST NOT reject,
+rewrite, route, or otherwise alter the proxied request.
+
+#### Scenario: Codex uses thread-id
+
+- **GIVEN** a request has user-agent `codex/1.2` and `thread-id: " conv-a "`
+- **WHEN** request-log client metadata is derived
+- **THEN** the conversation ID is `conv-a`
+
+#### Scenario: OpenCode uses ordered fallback headers
+
+- **GIVEN** a request has user-agent `opencode/1.0`, an empty
+  `x-parent-session-id`, an empty `x-opencode-session`, `x-session-id: fallback`,
+  and `x-session-affinity: affinity`
+- **WHEN** request-log client metadata is derived
+- **THEN** the conversation ID is `fallback`
+
+#### Scenario: OpenCode parent session takes precedence
+
+- **GIVEN** a request has user-agent `opencode/1.0`,
+  `x-parent-session-id: parent`, `x-opencode-session: child`,
+  `x-session-id: fallback`, and `x-session-affinity: affinity`
+- **WHEN** request-log client metadata is derived
+- **THEN** the conversation ID is `parent`
+
+#### Scenario: Prefix and header matching ignore case
+
+- **GIVEN** a request has user-agent ` CODEX/1.2 ` and header `Thread-Id:
+  conv-b`
+- **WHEN** request-log client metadata is derived
+- **THEN** the conversation ID is `conv-b`
+
+#### Scenario: Unsupported harnesses produce null metadata
+
+- **GIVEN** a request has no user-agent or has an unsupported user-agent and
+  includes a configured conversation header
+- **WHEN** request-log client metadata is derived
+- **THEN** the conversation ID is null
+- **AND** the request continues through the proxy unchanged
+
+### Requirement: Conversation metadata is nullable and indexed in request logs
+
+The request-log persistence model MUST store `conversation_id` as a nullable
+string and MUST provide an index named `idx_logs_conversation_id`. Existing rows
+MUST remain valid with a null conversation ID. Empty or whitespace-only detected
+values MUST be persisted as null.
+
+#### Scenario: Known conversation ID is persisted
+
+- **GIVEN** request-log metadata contains a non-empty conversation ID
+- **WHEN** the request log is persisted
+- **THEN** the stored `conversation_id` equals the trimmed ID
+
+#### Scenario: Missing conversation ID remains nullable
+
+- **GIVEN** request-log metadata contains no usable conversation ID
+- **WHEN** the request log is persisted
+- **THEN** the stored `conversation_id` is null
+
+### Requirement: Conversation metadata propagates through every request-log path
+
+The proxy MUST carry the detected nullable `conversation_id` into the shared
+request-log persistence sink for HTTP and WebSocket requests, including normal
+requests and preflight errors, and the compact, control, transcription, file,
+warmup, thread-goal, and model-source paths. WebSocket finalization and HTTP
+logging MUST preserve the same value derived from the inbound request headers.
+
+#### Scenario: Normal HTTP logs retain the inbound conversation
+
+- **GIVEN** a supported Codex or OpenCode request reaches the normal HTTP
+  request-log path with a usable conversation header
+- **WHEN** the path writes or finalizes its request log
+- **THEN** the persisted log contains that conversation ID
+
+#### Scenario: WebSocket logs retain the inbound conversation
+
+- **GIVEN** a supported request reaches the WebSocket request-log path with a
+  usable conversation header
+- **WHEN** that path persists its request log
+- **THEN** the persisted log contains the detected conversation ID
+
+#### Scenario: Preflight errors retain the inbound conversation
+
+- **GIVEN** a supported request reaches the HTTP preflight-error log path with
+  a usable conversation header
+- **WHEN** that path persists its request log
+- **THEN** the persisted log contains the detected conversation ID
+
+#### Scenario: Compact logs retain the inbound conversation
+
+- **GIVEN** a supported request reaches the compact log path with a usable
+  conversation header
+- **WHEN** that path persists its request log
+- **THEN** the persisted log contains the detected conversation ID
+
+#### Scenario: Control logs retain the inbound conversation
+
+- **GIVEN** a supported request reaches the control log path with a usable
+  conversation header
+- **WHEN** that path persists its request log
+- **THEN** the persisted log contains the detected conversation ID
+
+#### Scenario: Transcription logs retain the inbound conversation
+
+- **GIVEN** a supported request reaches the transcription log path with a
+  usable conversation header
+- **WHEN** that path persists its request log
+- **THEN** the persisted log contains the detected conversation ID
+
+#### Scenario: File logs retain the inbound conversation
+
+- **GIVEN** a supported request reaches the file log path with a usable
+  conversation header
+- **WHEN** that path persists its request log
+- **THEN** the persisted log contains the detected conversation ID
+
+#### Scenario: Warmup logs retain the inbound conversation
+
+- **GIVEN** a supported request reaches the warmup log path with a usable
+  conversation header
+- **WHEN** that path persists its request log
+- **THEN** the persisted log contains the detected conversation ID
+
+#### Scenario: Thread-goal logs retain the inbound conversation
+
+- **GIVEN** a supported request reaches the thread-goal log path with a usable
+  conversation header
+- **WHEN** that path persists its request log
+- **THEN** the persisted log contains the detected conversation ID
+
+#### Scenario: Model-source logs retain the inbound conversation
+
+- **GIVEN** a model-source request has a supported conversation header
+- **WHEN** the model-source path persists its request log
+- **THEN** the persisted log contains the detected conversation ID
 
 ### Requirement: Request logs persist client IP for Responses traffic
 
@@ -272,20 +444,46 @@ The proxy MUST persist nullable low-cardinality request-log fields for TTFT phas
 - **THEN** the request log can record first upstream event latency separately from first downstream token latency
 
 ### Requirement: Codex prewarm canary outcomes are observable
-The proxy MUST record visible-request prewarm status, latency, canary bucket, and eligibility cohort using stable strings, and MUST emit a prewarm outcome counter labelled only by outcome, cohort, and bucket.
 
-#### Scenario: Canary miss is visible without raw identifiers
-- **WHEN** Codex prewarm is enabled but deterministic canary sampling excludes an otherwise eligible request
-- **THEN** the visible request log records `prewarm_status=canary_miss`
-- **AND** metrics increment the prewarm counter for the stable cohort and bucket
-- **AND** logs and metrics do not include raw API keys, raw session ids, prompt text, or affinity key values
+The proxy MUST record visible-request prewarm status and latency using
+stable strings, and MUST emit a prewarm outcome counter labelled only by
+outcome. Prewarm eligibility is the prewarm enabled flag alone: no
+deterministic canary sampling or allow/deny cohort exists, so no canary
+bucket or eligibility cohort dimension is recorded and the
+`prewarm_status=canary_miss` value MUST NOT occur.
+
+#### Scenario: Prewarm outcome is visible without raw identifiers
+
+- **WHEN** Codex prewarm is enabled and a visible request triggers or skips
+  a session prewarm
+- **THEN** the visible request log records `prewarm_status` (and prewarm
+  latency when a prewarm was attempted)
+- **AND** metrics increment the outcome-labelled prewarm counter
+- **AND** logs and metrics do not include raw API keys, raw session ids,
+  prompt text, or affinity key values
+
+#### Scenario: Canary sampling no longer excludes eligible requests
+
+- **WHEN** Codex prewarm is enabled
+- **THEN** no request is excluded by deterministic canary sampling
+- **AND** `prewarm_status=canary_miss` is never recorded
+- **AND** the prewarm counter and request log carry no canary bucket or
+  eligibility cohort dimension (the legacy request-log columns remain
+  unwritten for one release for rolling-upgrade safety, then are dropped)
 
 ### Requirement: 24-hour TTFT breakdown queries are available
-Operators MUST have an OpenSpec context runbook or dashboard artifact with 24-hour TTFT breakdown queries by user agent group, upstream transport, model/cache ratio, session gap cohort, prompt size cohort, and prewarm bucket/outcome/cohort.
+
+Operators MUST have an OpenSpec context runbook or dashboard artifact with
+24-hour TTFT breakdown queries by user agent group, upstream transport,
+model/cache ratio, session gap cohort, prompt size cohort, and prewarm
+status/outcome.
 
 #### Scenario: Operator investigates TTFT regression
-- **WHEN** an operator needs to inspect the last 24 hours of request-log latency
-- **THEN** the repository provides SQL that reports p50, p90, p95 TTFT and total latency for the requested breakdowns
+
+- **WHEN** an operator needs to inspect the last 24 hours of request-log
+  latency
+- **THEN** the repository provides SQL that reports p50, p90, p95 TTFT and
+  total latency for the requested breakdowns
 
 ### Requirement: Dashboard request logs show generation speed
 
@@ -306,7 +504,7 @@ The dashboard request-log table MUST show time to first token and output-token g
 
 ### Requirement: Reports show daily median generation speed trends
 
-The Reports dashboard MUST expose daily median TTFT and daily median TPS trends when request-log latency fields are available. Empty days and rows with no valid timing/speed inputs MUST render as zero in those trend charts. Daily TPS MUST median per-request output-token TPS after TTFT rather than use input tokens or include TTFT wait time.
+The Reports dashboard MUST expose daily median TTFT, daily median TPS, and daily median queue-wait trends when request-log latency fields are available. Empty days and rows with no valid timing/speed inputs MUST render as zero in those trend charts. Daily TPS MUST median per-request output-token TPS after TTFT rather than use input tokens or include TTFT wait time. Daily queue wait MUST median per-request `latency_queue_ms` over rows where it is non-null.
 
 #### Scenario: Daily speed charts use median valid request values
 
@@ -320,6 +518,13 @@ The Reports dashboard MUST expose daily median TTFT and daily median TPS trends 
 - **GIVEN** a selected report range includes a day with no request logs or no valid timing data
 - **WHEN** the dashboard renders Reports
 - **THEN** the TTFT and TPS charts include that day with value zero
+
+#### Scenario: Daily queue-wait trend surfaces load-balancer wait
+
+- **GIVEN** a report day has request logs with non-null `latency_queue_ms`
+- **WHEN** the dashboard renders Reports
+- **THEN** it shows a queue-wait trend using the day's median `latency_queue_ms`
+- **AND** days without queue samples render as zero
 
 ### Requirement: Websocket responses capture request-log latency timings
 
@@ -392,4 +597,191 @@ Request-log rows MUST be persisted by tracked background tasks that the response
 
 - **WHEN** the service shuts down gracefully with log writes in flight
 - **THEN** shutdown waits for them up to the configured drain timeout and reports tasks that failed to drain
+
+### Requirement: Request speed timings share one anchor and expose queue wait
+
+For a single request-log row, `latency_ms` and `latency_first_token_ms` MUST be
+measured from the same anchor: the start of the attempt that produced the row.
+Time spent before that attempt — account selection, admission waits, and failed
+failover attempts — MUST NOT inflate `latency_first_token_ms`; the HTTP
+streaming path MUST record it instead in a nullable `latency_queue_ms`
+request-log column. First-token detection MUST treat the first output delta of
+any kind — visible text, refusal, or reasoning deltas — as the first token, so
+TTFT means time to first model output and the generation window
+(`latency_ms - latency_first_token_ms`) covers reasoning generation, matching
+the reasoning-inclusive `output_tokens` numerator used for TPS.
+
+#### Scenario: Failover no longer inflates TTFT
+
+- **GIVEN** a streaming request fails over from one account and succeeds on the
+  next attempt
+- **WHEN** the request log is persisted
+- **THEN** `latency_first_token_ms` reflects only the successful attempt
+- **AND** `latency_queue_ms` records the pre-attempt time (selection plus the
+  failed attempt)
+- **AND** `latency_ms` is greater than or equal to `latency_first_token_ms`
+
+#### Scenario: Reasoning delta counts as the first token
+
+- **GIVEN** an upstream stream emits a reasoning summary delta before the first
+  visible text delta
+- **WHEN** first-token latency is captured
+- **THEN** `latency_first_token_ms` anchors to the reasoning delta rather than
+  waiting for visible text
+
+#### Scenario: Single-anchor rows on websocket and bridge paths
+
+- **WHEN** a websocket or HTTP bridge request records latency timings
+- **THEN** `latency_ms` and `latency_first_token_ms` derive from the same
+  request-state anchor
+- **AND** `latency_queue_ms` MAY be null on paths whose queue waits are already
+  recorded in dedicated phase columns
+
+### Requirement: Cap partition replica count is observable
+
+The service MUST expose a Prometheus gauge named `codex_lb_cap_partition_replicas` whose value equals the live replica count currently used for account cap partitioning, and it MUST log adopted partition rebalances at info level with the old count, the new count, and this replica's rank. The gauge and log MUST NOT include account ids, instance secrets, or request payload content.
+
+#### Scenario: Partition rebalance updates the gauge
+
+- **GIVEN** a replica whose adopted partition has replica count 1
+- **WHEN** a partition refresh observes and adopts two active members
+- **THEN** `codex_lb_cap_partition_replicas` reports 2
+- **AND** an info-level log records the rebalance from count 1 to count 2 with the replica's rank
+
+### Requirement: Source-routed requests report upstream-measured generation timings
+
+The proxy MUST record upstream-reported generation timing on the request log
+for source-routed chat/responses/audio-transcription requests when the
+OpenAI-compatible source's response body includes a `metrics` object with
+`time_to_first_token_ms` and `generation_time_ms`. The proxy MUST set
+`latency_first_token_ms` to the reported time-to-first-token and `latency_ms`
+to the sum of time-to-first-token and generation time, using the same
+request-log fields subscription-backed requests already populate. Sources
+that do not return a `metrics` object MUST leave both fields `null`, and
+negative or non-numeric values MUST be rejected rather than recorded.
+Non-finite numeric values (`NaN`, positive infinity, or negative infinity)
+MUST also be rejected rather than failing or interrupting the proxied request.
+
+#### Scenario: Source metrics populate TTFT and total latency
+
+- **GIVEN** an OpenAI-compatible source's chat completion response includes
+  `metrics: {time_to_first_token_ms: 108.83, generation_time_ms: 162.98}`
+- **WHEN** the request is logged
+- **THEN** the request log's `latency_first_token_ms` is `109`
+- **AND** the request log's `latency_ms` is `272`
+
+#### Scenario: Streamed responses capture metrics from the final frame
+
+- **GIVEN** a source-routed streaming chat completion whose final SSE frame
+  carries both `usage` and `metrics`
+- **WHEN** the stream completes successfully
+- **THEN** the request log records the same `latency_first_token_ms` /
+  `latency_ms` derived from that frame's `metrics`
+
+#### Scenario: Missing metrics leaves latency fields null
+
+- **GIVEN** an OpenAI-compatible source's response includes no `metrics` object
+- **WHEN** the request is logged
+- **THEN** `latency_ms` and `latency_first_token_ms` remain `null`, unchanged
+  from prior behavior
+
+#### Scenario: Dashboard retains generation-only throughput semantics
+
+- **GIVEN** a source response reports `time_to_first_token_ms: 108.83`,
+  `generation_time_ms: 162.98`, and `9` output tokens
+- **WHEN** the existing dashboard computes tokens per second as output tokens
+  divided by `latency_ms - latency_first_token_ms`
+- **THEN** it reports approximately `55.2` generation tokens per second
+- **AND** it does not substitute an upstream `tokens_per_second` value that may
+  include TTFT
+
+#### Scenario: Non-finite metrics are ignored safely
+
+- **GIVEN** a source response contains `NaN` or infinity in either timing field
+- **WHEN** the proxy parses the optional metrics
+- **THEN** both timing values remain unset
+- **AND** the otherwise successful proxied request is not interrupted
+
+### Requirement: Shipped high-error-rate alert uses aggregate request share
+
+The shipped `CodexLBHighErrorRate` alert MUST calculate, independently for each
+namespace and job, the sum of five-minute 5xx request rates divided by the sum
+of all five-minute request rates. Method, path, status, instance, replica, and
+other non-scope labels MUST be aggregated before division. The alert MUST
+compare the aggregate ratio to 0.05 and MUST require it to remain above that
+threshold for five minutes.
+
+#### Scenario: Mixed success and error series produce their aggregate share
+
+- **GIVEN** one namespace and job have positive 2xx and 5xx request rates
+- **WHEN** the high-error-rate alert expression is evaluated
+- **THEN** the ratio equals the sum of 5xx request rates divided by the sum of
+  all request rates
+- **AND** the ratio is not 1 unless all requests in that group are 5xx
+
+#### Scenario: Alert groups remain isolated
+
+- **GIVEN** request series exist for more than one namespace or job
+- **WHEN** the high-error-rate alert expression is evaluated
+- **THEN** each namespace and job pair has an independent aggregate ratio
+- **AND** traffic from one pair is not included in another pair
+
+#### Scenario: Threshold and duration apply to the aggregate ratio
+
+- **GIVEN** one namespace and job have an aggregate 5xx share above 0.05
+- **WHEN** that aggregate share remains above 0.05 for five minutes
+- **THEN** `CodexLBHighErrorRate` fires for that namespace and job pair
+
+### Requirement: Bundled Grafana 5xx stat uses selected aggregate request share
+
+The bundled Grafana `Error Rate (5xx)` stat MUST apply the selected namespace
+and job filters to both operands, aggregate all remaining request-series labels
+before division, and display the resulting 5xx share as one value. When the
+selected total request rate is positive but no matching 5xx series exists, the
+stat MUST display 0%.
+
+#### Scenario: Selected mixed traffic produces one aggregate value
+
+- **GIVEN** the selected namespace and job have positive 2xx and 5xx request
+  rates across one or more request or replica label combinations
+- **WHEN** the Grafana error-rate stat is evaluated
+- **THEN** it displays the sum of selected 5xx request rates divided by the sum
+  of all selected request rates
+
+#### Scenario: Dashboard selection filters both operands
+
+- **GIVEN** request series exist inside and outside the selected namespace and
+  job
+- **WHEN** the Grafana error-rate stat is evaluated
+- **THEN** both the 5xx numerator and total denominator exclude traffic outside
+  the selected namespace and job
+
+#### Scenario: Success-only traffic displays zero
+
+- **GIVEN** the selected scope has a positive successful-request rate
+- **AND** no matching 5xx series exists
+- **WHEN** the Grafana error-rate stat is evaluated
+- **THEN** the stat displays 0%
+
+### Requirement: Stream pool congestion is observable
+
+When Prometheus support is available the service MUST expose a gauge named `codex_lb_stream_pool_capacity` whose value equals the fair-share gate's most recently computed candidate pool capacity and a gauge named `codex_lb_stream_pool_inflight` whose value equals the corresponding pool in-flight stream count, and a counter named `codex_lb_api_key_fair_share_rejections_total` incremented once per fair-share denial. The gauges and the counter MUST NOT carry API-key, account, or request labels. Each fair-share denial MUST log at warning level with the requesting `api_key_id`, the key's in-flight count, the computed fair share, the pool in-flight and capacity, and the active-key count, and MUST NOT include other keys' identifiers, instance secrets, or request payload content. All fair-share metrics MUST degrade to no-ops when the Prometheus client is absent.
+
+#### Scenario: Pool gauges are exported during gate evaluation
+
+- **GIVEN** the fair-share gate is enabled and evaluates a stream selection
+- **WHEN** metrics are scraped
+- **THEN** `codex_lb_stream_pool_capacity` and `codex_lb_stream_pool_inflight` report the evaluated pool values without per-key or per-account labels
+
+#### Scenario: Denials are counted without key cardinality
+
+- **GIVEN** repeated fair-share denials for multiple keys
+- **WHEN** metrics are scraped
+- **THEN** `codex_lb_api_key_fair_share_rejections_total` reflects the total denial count with no per-key label
+
+#### Scenario: Denial log carries the diagnostic numbers
+
+- **GIVEN** a fair-share denial
+- **WHEN** the warning is logged
+- **THEN** it includes the requester's `api_key_id`, key in-flight count, fair share, pool in-flight, pool capacity, and active-key count and no other key's identifier
 

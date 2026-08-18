@@ -1,3 +1,5 @@
+import { useTranslation } from "react-i18next";
+
 import {
   AreaChart,
   Area,
@@ -10,6 +12,7 @@ import {
 import type { DailyReportRow } from "../schemas";
 import { buildContinuousDailyRows } from "../daily-series";
 import { ChartTooltip } from "./chart-tooltip";
+import { ReportChartCard } from "./report-chart-card";
 
 export type TimeToFirstTokenChartProps = {
   startDate: string;
@@ -22,15 +25,14 @@ function formatSeconds(value: number): string {
 }
 
 export function TimeToFirstTokenChart({ startDate, endDate, data }: TimeToFirstTokenChartProps) {
+  const { t } = useTranslation();
   const chartData = buildContinuousDailyRows(startDate, endDate, data).map((d) => ({
     date: d.date.slice(5),
     ttft: d.medianTtftMs ?? 0,
   }));
 
   return (
-    <div className="rounded-xl border bg-card p-5">
-      <div className="text-sm font-semibold text-foreground">Time to First Token</div>
-      <div className="mt-4 h-[200px]">
+    <ReportChartCard title={t("reports.charts.timeToFirstToken")} empty={data.length === 0}>
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart data={chartData} margin={{ top: 5, right: 10, left: 10, bottom: 0 }}>
             <defs>
@@ -53,7 +55,7 @@ export function TimeToFirstTokenChart({ startDate, endDate, data }: TimeToFirstT
               tickFormatter={formatSeconds}
             />
             <Tooltip
-              content={<ChartTooltip names={{ ttft: "Median TTFT" }} formatValue={formatSeconds} />}
+              content={<ChartTooltip names={{ ttft: t("reports.charts.medianTtft") }} formatValue={formatSeconds} />}
             />
             <Area
               type="monotone"
@@ -66,7 +68,6 @@ export function TimeToFirstTokenChart({ startDate, endDate, data }: TimeToFirstT
             />
           </AreaChart>
         </ResponsiveContainer>
-      </div>
-    </div>
+    </ReportChartCard>
   );
 }

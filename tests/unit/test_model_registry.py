@@ -27,7 +27,7 @@ EXPECTED_CORE_MODEL_PLANS = {
 }
 
 # The 21-plan list upstream advertises for GPT-5.6
-# (codex-rs/models-manager/models.json at rust-v0.144.1).
+# (codex-rs/models-manager/models.json at rust-v0.145.0).
 EXPECTED_GPT56_MODEL_PLANS = {
     "business",
     "edu",
@@ -242,7 +242,7 @@ def test_bootstrap_models_include_representative_upstream_metadata():
 
     sol = models["gpt-5.6-sol"]
     assert sol.display_name == "GPT-5.6-Sol"
-    assert sol.context_window == 372_000
+    assert sol.context_window == 272_000
     assert sol.default_reasoning_level == "low"
     assert [level.effort for level in sol.supported_reasoning_levels] == [
         "low",
@@ -271,10 +271,11 @@ def test_bootstrap_models_include_representative_upstream_metadata():
     assert luna.default_reasoning_level == "medium"
     assert [level.effort for level in luna.supported_reasoning_levels] == ["low", "medium", "high", "xhigh", "max"]
 
-    # Upstream-exact GPT-5.6 raw metadata (codex-rs/models-manager/models.json
-    # at rust-v0.144.1).
+    # Reproducible upstream catalog evidence:
+    # codex-rs/models-manager/models.json at rust-v0.145.0.
     for gpt56 in (sol, terra, luna):
         assert gpt56.minimal_client_version == "0.144.0"
+        assert gpt56.context_window == 272_000
         assert gpt56.raw["tool_mode"] == "code_mode_only"
         assert gpt56.raw["use_responses_lite"] is True
         assert gpt56.raw["apply_patch_tool_type"] == "freeform"
@@ -287,7 +288,7 @@ def test_bootstrap_models_include_representative_upstream_metadata():
         assert gpt56.raw["include_skills_usage_instructions"] is False
         assert gpt56.raw["experimental_supported_tools"] == []
         assert gpt56.raw["supports_search_tool"] is True
-        assert gpt56.raw["max_context_window"] == 372_000
+        assert gpt56.raw["max_context_window"] == 272_000
         assert gpt56.raw["service_tiers"] == [
             {"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"}
         ]
@@ -433,9 +434,12 @@ async def test_plan_types_for_model_service_tier_tracks_tier_plans():
     model_plans = registry.plan_types_for_model("gpt-5.5")
     assert model_plans is not None
     assert {"pro", "plus"}.issubset(model_plans)
-    assert registry.plan_types_for_model_service_tier("gpt-5.5", "priority") == frozenset({"pro"})
-    assert registry.plan_types_for_model_service_tier("gpt-5.5", "fast") == frozenset({"pro"})
+    for service_tier in ("priority", " Priority ", "PRIORITY", "fast", " FAST "):
+        assert registry.plan_types_for_model_service_tier("gpt-5.5", service_tier) == frozenset({"pro"})
     assert registry.plan_types_for_model_service_tier("gpt-5.5", "default") == frozenset({"plus"})
+    assert registry.plan_types_for_model_service_tier("gpt-5.5", None) == model_plans
+    assert registry.plan_types_for_model_service_tier("gpt-5.5", "   ") == model_plans
+    assert registry.plan_types_for_model_service_tier("gpt-5.5", "auto") == frozenset()
 
 
 @pytest.mark.asyncio
@@ -458,6 +462,24 @@ async def test_account_ids_for_model_service_tier_tracks_account_catalogs():
     assert registry.account_ids_for_model_service_tier("gpt-5.5", "priority") == frozenset({"account-fast"})
     assert registry.account_ids_for_model_service_tier("gpt-5.5", "fast") == frozenset({"account-fast"})
     assert registry.account_ids_for_model_service_tier("gpt-5.5", "default") == frozenset({"account-default"})
+
+
+@pytest.mark.asyncio
+async def test_plan_types_for_model_service_tier_rejects_missing_authoritative_tier_map():
+    model = replace(_model("gpt-5.5"), raw={})
+    registry = ModelRegistry(ttl_seconds=60.0)
+    await registry.update(
+        {"pro": [model]},
+        per_account_results={"account-pro": ("pro", [])},
+        active_account_plans={"account-pro": "pro"},
+    )
+
+    snapshot = registry.get_snapshot()
+    assert snapshot is not None
+    assert snapshot.account_catalogs_authoritative is True
+    assert registry.plan_types_for_model("gpt-5.5") == frozenset({"pro"})
+    assert registry.account_ids_for_model_service_tier("gpt-5.5", "flex") == frozenset()
+    assert registry.plan_types_for_model_service_tier("gpt-5.5", "flex") == frozenset()
 
 
 @pytest.mark.asyncio

@@ -63,6 +63,9 @@ export const DashboardSettingsSchema = z
     upstreamProxyDefaultPoolId: z.string().nullable().optional().default(null),
     preferEarlierResetAccounts: z.boolean(),
     preferEarlierResetWindow: z.enum(["primary", "secondary"]).optional().default("secondary"),
+    showResetCreditBadges: z.boolean().optional().default(true),
+    autoRedeemResetCreditsBeforeExpiry: z.boolean().optional().default(false),
+    showResetCreditExpiryBadge: z.boolean().optional().default(true),
     routingStrategy: RoutingStrategySchema.optional().default("usage_weighted"),
     relativeAvailabilityPower: z.number().positive().optional().default(2),
     relativeAvailabilityTopK: z
@@ -76,6 +79,7 @@ export const DashboardSettingsSchema = z
     proxyAccountResponseCreateLimit: z.number().int().min(0).optional().default(4),
     proxyAccountStreamLimit: z.number().int().min(0).optional().default(8),
     proxyAccountStreamRecoveryReserve: z.number().int().min(0).optional().default(1),
+    proxyApiKeyFairShareCongestionThresholdPct: z.number().int().min(0).max(100).optional().default(0),
     openaiCacheAffinityMaxAgeSeconds: z
       .number()
       .int()
@@ -129,6 +133,10 @@ export const DashboardSettingsSchema = z
     guestAccessEnabled: z.boolean().optional().default(false),
     guestPasswordConfigured: z.boolean().optional().default(false),
     limitWarmupStaggeredIdleEnabled: z.boolean().optional().default(false),
+    requestLogRetentionDays: z.number().int().min(0).max(3650).optional().default(0),
+    usageHistoryRetentionDays: z.number().int().min(0).max(3650).optional().default(0),
+    requestLogRetentionOverrideDays: z.number().int().min(0).max(3650).nullable().optional().default(null),
+    usageHistoryRetentionOverrideDays: z.number().int().min(0).max(3650).nullable().optional().default(null),
     version: z.number().int().min(1).optional(),
   })
   .transform((settings) => {
@@ -165,6 +173,9 @@ export const SettingsUpdateRequestSchema = z
     upstreamProxyDefaultPoolId: z.string().nullable().optional(),
     preferEarlierResetAccounts: z.boolean().optional(),
     preferEarlierResetWindow: z.enum(["primary", "secondary"]).optional(),
+    showResetCreditBadges: z.boolean().optional(),
+    autoRedeemResetCreditsBeforeExpiry: z.boolean().optional(),
+    showResetCreditExpiryBadge: z.boolean().optional(),
     routingStrategy: RoutingStrategySchema.optional(),
     relativeAvailabilityPower: z.number().positive().optional(),
     relativeAvailabilityTopK: z.number().int().min(1).max(20).optional(),
@@ -172,6 +183,7 @@ export const SettingsUpdateRequestSchema = z
     proxyAccountResponseCreateLimit: z.number().int().min(0).optional(),
     proxyAccountStreamLimit: z.number().int().min(0).optional(),
     proxyAccountStreamRecoveryReserve: z.number().int().min(0).optional(),
+    proxyApiKeyFairShareCongestionThresholdPct: z.number().int().min(0).max(100).optional(),
     openaiCacheAffinityMaxAgeSeconds: z.number().int().positive().optional(),
     dashboardSessionTtlSeconds: z.number().int().min(3600).optional(),
     stickyReallocationBudgetThresholdPct: z.number().min(0).max(100).optional(),
@@ -197,6 +209,10 @@ export const SettingsUpdateRequestSchema = z
     weeklyPaceSmoothingMinutes: WeeklyPaceSmoothingMinutesSchema.optional(),
     guestAccessEnabled: z.boolean().optional(),
     limitWarmupStaggeredIdleEnabled: z.boolean().optional(),
+    // Tri-state overrides: absent = unchanged, null = clear (inherit env
+    // alias), value = store the override.
+    requestLogRetentionOverrideDays: z.number().int().min(0).max(3650).nullable().optional(),
+    usageHistoryRetentionOverrideDays: z.number().int().min(0).max(3650).nullable().optional(),
   })
   .superRefine((settings, ctx) => {
     if (
@@ -209,6 +225,30 @@ export const SettingsUpdateRequestSchema = z
         code: "custom",
         path: ["proxyAccountStreamRecoveryReserve"],
         message: "proxyAccountStreamRecoveryReserve must not exceed proxyAccountStreamLimit",
+      });
+    }
+    if (
+      settings.requestLogRetentionOverrideDays !== undefined &&
+      settings.requestLogRetentionOverrideDays !== null &&
+      settings.requestLogRetentionOverrideDays !== 0 &&
+      settings.requestLogRetentionOverrideDays < 30
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["requestLogRetentionOverrideDays"],
+        message: "request_log_retention_override_days must be 0 (disabled) or >= 30",
+      });
+    }
+    if (
+      settings.usageHistoryRetentionOverrideDays !== undefined &&
+      settings.usageHistoryRetentionOverrideDays !== null &&
+      settings.usageHistoryRetentionOverrideDays !== 0 &&
+      settings.usageHistoryRetentionOverrideDays < 45
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["usageHistoryRetentionOverrideDays"],
+        message: "usage_history_retention_override_days must be 0 (disabled) or >= 45",
       });
     }
   });
@@ -303,6 +343,132 @@ export const UpstreamProxyAdminSchema = z.object({
   bindings: z.array(AccountProxyBindingSchema),
 });
 
+export const TelemetryConsentStateSchema = z.enum(["undecided", "enabled", "disabled"]);
+export const TelemetryConsentSourceSchema = z.enum(["env", "persisted", "default"]);
+
+// Wire-format (snake_case) mirror of app/modules/telemetry/schemas.py. Every
+// object is strict so backend drift (renamed, added, or removed fields) fails
+// schema parsing instead of passing silently.
+const TelemetryDeploymentSnapshotSchema = z.strictObject({
+  method: z.enum(["docker", "k8s", "pip", "bare"]),
+  db_backend: z.enum(["sqlite", "postgres"]),
+  db_size_bucket: z.enum(["unknown", "<100MB", "100MB-1GB", "1-5GB", "5-10GB", "10-50GB", "50GB+"]),
+  replicas: z.number().int().min(1),
+  reverse_proxy: z.boolean(),
+});
+
+const TelemetryPlanMixSnapshotSchema = z.strictObject({
+  plus: z.string(),
+  pro: z.string(),
+  team: z.string(),
+  free: z.string(),
+});
+
+const TelemetryAccountsSnapshotSchema = z.strictObject({
+  pool_bucket: z.string(),
+  plan_mix: TelemetryPlanMixSnapshotSchema,
+  workspace_accounts: z.boolean(),
+  routing_policy: z.string(),
+  limit_warmup_enabled: z.boolean(),
+  egress_proxy_used: z.boolean(),
+});
+
+const TelemetryRequestKindsSnapshotSchema = z.strictObject({
+  responses: z.number(),
+  chat: z.number(),
+  images: z.number(),
+  unknown: z.number(),
+});
+
+const TelemetryTransportMixSnapshotSchema = z.strictObject({
+  ws: z.number(),
+  http_bridge: z.number(),
+});
+
+const TelemetryServiceTierMixSnapshotSchema = z.strictObject({
+  default: z.number(),
+  flex: z.number(),
+  priority: z.number(),
+});
+
+const TelemetryModelUsageSnapshotSchema = z.strictObject({
+  name: z.string(),
+  share: z.number(),
+  reasoning: z.record(z.string(), z.number()),
+  avg_output_tokens_bucket: z.string(),
+});
+
+const TelemetryUsageSnapshotSchema = z.strictObject({
+  requests: z.number().int().min(0),
+  success_rate: z.number().min(0).max(1),
+  tokens_input: z.number().int().min(0),
+  tokens_output: z.number().int().min(0),
+  tokens_cached_ratio: z.number().min(0).max(1),
+  cost_usd_bucket: z.string(),
+  request_kinds: TelemetryRequestKindsSnapshotSchema,
+  transport_mix: TelemetryTransportMixSnapshotSchema,
+  service_tier_mix: TelemetryServiceTierMixSnapshotSchema,
+  clients: z.record(z.string(), z.number()),
+  clients_other_ratio: z.number().min(0).max(1),
+  models: z.array(TelemetryModelUsageSnapshotSchema),
+  latency_ms_p50: z.number().int().min(0),
+  ttft_ms_p50: z.number().int().min(0),
+  ttft_ms_p95: z.number().int().min(0),
+  rate_limit_429_ratio: z.number().min(0).max(1),
+  top_upstream_errors: z.array(z.string()).max(5),
+});
+
+const TelemetryFeaturesSnapshotSchema = z.strictObject({
+  api_firewall: z.boolean(),
+  quota_planner: z.boolean(),
+  sticky_sessions: z.boolean(),
+  conversation_archive: z.boolean(),
+  automations: z.boolean(),
+  fleet: z.boolean(),
+  model_sources_count: z.number().int().min(0),
+  api_keys_bucket: z.string(),
+  prometheus: z.boolean(),
+  otel: z.boolean(),
+  dashboard_auth: z.boolean(),
+  reset_credits: z.boolean(),
+  image_api_used: z.boolean(),
+});
+
+export const TelemetrySnapshotSchema = z.strictObject({
+  schema_version: z.literal(1),
+  instance_id: z.string(),
+  version: z.string(),
+  python: z.string(),
+  os: z.string(),
+  arch: z.string(),
+  uptime_hours: z.number().int().min(0),
+  deploy: TelemetryDeploymentSnapshotSchema,
+  accounts: TelemetryAccountsSnapshotSchema,
+  usage_7d: TelemetryUsageSnapshotSchema,
+  features: TelemetryFeaturesSnapshotSchema,
+});
+
+// The exact body the instance would transmit; the consent dialog and the
+// settings preview render this envelope verbatim.
+export const TelemetrySnapshotEnvelopeSchema = z.strictObject({
+  instance_id: z.string(),
+  metrics: TelemetrySnapshotSchema,
+  timestamp: z.iso.datetime({ offset: true }),
+});
+
+export const TelemetryConsentSchema = z.object({
+  state: TelemetryConsentStateSchema,
+  source: TelemetryConsentSourceSchema,
+  active: z.boolean(),
+  // Present only when the backend built a snapshot: undecided consent with
+  // default source (the dialog case) or an explicit include_preview request.
+  preview: TelemetrySnapshotEnvelopeSchema.nullable(),
+});
+
+export const TelemetryConsentUpdateRequestSchema = z.object({
+  enabled: z.boolean(),
+});
+
 export type UpstreamProxyEndpoint = z.infer<typeof UpstreamProxyEndpointSchema>;
 export type UpstreamProxyEndpointCreateRequest = z.infer<typeof UpstreamProxyEndpointCreateRequestSchema>;
 export type UpstreamProxyEndpointTestResponse = z.infer<typeof UpstreamProxyEndpointTestResponseSchema>;
@@ -312,3 +478,7 @@ export type UpstreamProxyPoolMemberRequest = z.infer<typeof UpstreamProxyPoolMem
 export type AccountProxyBinding = z.infer<typeof AccountProxyBindingSchema>;
 export type AccountProxyBindingRequest = z.infer<typeof AccountProxyBindingRequestSchema>;
 export type UpstreamProxyAdmin = z.infer<typeof UpstreamProxyAdminSchema>;
+export type TelemetrySnapshot = z.infer<typeof TelemetrySnapshotSchema>;
+export type TelemetrySnapshotEnvelope = z.infer<typeof TelemetrySnapshotEnvelopeSchema>;
+export type TelemetryConsent = z.infer<typeof TelemetryConsentSchema>;
+export type TelemetryConsentUpdateRequest = z.infer<typeof TelemetryConsentUpdateRequestSchema>;

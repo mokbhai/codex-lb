@@ -27,7 +27,7 @@ from app.core.openai.requests import ResponsesCompactRequest
 from app.core.upstream_proxy import UpstreamProxyRouteError
 from app.db.models import Account, AccountStatus
 from app.modules.api_keys.service import ApiKeyData, ApiKeyUsageReservationData
-from app.modules.proxy._service.support import _call_with_supported_optional_kwargs, _request_log_useragent_fields
+from app.modules.proxy._service.support import _call_with_supported_optional_kwargs, _request_log_client_fields
 from app.modules.proxy.helpers import _header_account_id, _normalize_error_code, _parse_openai_error
 from app.modules.proxy.request_policy import normalize_upstream_model_alias, validate_model_access
 
@@ -248,7 +248,6 @@ class _WarmupMixin:
                     headers=filtered_headers,
                     warmup_model=effective_model,
                     prohibit_fast_mode=prohibit_fast_mode,
-                    allow_pre_submit_errors_as_result=len(accounts_to_submit) > 1,
                 )
 
         submission_results = await asyncio.gather(*(_submit_account_warmup(account) for account in accounts_to_submit))
@@ -300,10 +299,9 @@ class _WarmupMixin:
         headers: Mapping[str, str],
         warmup_model: str,
         prohibit_fast_mode: bool,
-        allow_pre_submit_errors_as_result: bool = False,
     ) -> _WarmupSubmitResult:
         started_at = time.monotonic()
-        useragent, useragent_group = _request_log_useragent_fields(headers)
+        useragent, useragent_group, conversation_id = _request_log_client_fields(headers)
         live_account = _materialize_warmup_account(account)
         request_id = str(uuid4())
         upstream_headers = {
@@ -423,13 +421,9 @@ class _WarmupMixin:
         except ProxyAuthError as exc:
             error_code = "auth_error"
             error_message = str(exc) or "Warmup authentication failed"
-            if not allow_pre_submit_errors_as_result:
-                raise
         except ProxyRateLimitError as exc:
             error_code = "rate_limit_exceeded"
             error_message = str(exc) or "Warmup request was rate limited"
-            if not allow_pre_submit_errors_as_result:
-                raise
         except Exception as exc:
             error_code = "upstream_error"
             error_message = str(exc) or "Warmup request failed"
@@ -457,6 +451,7 @@ class _WarmupMixin:
                     upstream_proxy_fail_closed_reason=upstream_proxy_fail_closed_reason,
                     useragent=useragent,
                     useragent_group=useragent_group,
+                    conversation_id=conversation_id,
                 )
             finally:
                 await proxy._release_websocket_reservation(reservation)

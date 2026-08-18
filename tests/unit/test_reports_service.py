@@ -8,9 +8,76 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.modules.reports.repository import DailyReportRangeTooLargeError, ReportsRepository
-from app.modules.reports.service import ReportsService
+from app.modules.reports.service import InvalidReportDateRangeError, ReportsService
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start_date", "end_date", "report_timezone"),
+    [
+        pytest.param(
+            date(2026, 2, 15),
+            date(2026, 2, 16),
+            "Africa/Casablanca",
+            id="casablanca-offset-to-zero",
+        ),
+        pytest.param(
+            date(2026, 3, 22),
+            date(2026, 3, 23),
+            "Africa/Casablanca",
+            id="casablanca-offset-from-zero",
+        ),
+        pytest.param(date(2026, 6, 1), date(2026, 6, 2), "UTC", id="utc"),
+        pytest.param(
+            date(2026, 6, 1),
+            date(2026, 6, 2),
+            "Africa/Casablanca",
+            id="casablanca-stable-offset",
+        ),
+        pytest.param(
+            date(2026, 6, 1),
+            date(2026, 6, 2),
+            "Mars/Olympus_Mons",
+            id="invalid-zone-utc-fallback",
+        ),
+    ],
+)
+async def test_get_reports_averages_use_inclusive_local_calendar_days(
+    start_date: date,
+    end_date: date,
+    report_timezone: str,
+) -> None:
+    summary = SimpleNamespace(
+        total_cost_usd=60.0,
+        total_input_tokens=0,
+        total_output_tokens=0,
+        total_cached_tokens=0,
+        total_requests=30,
+        conversation_count=0,
+        total_errors=0,
+        total_cancelled=0,
+        active_accounts=1,
+    )
+    repo = SimpleNamespace(
+        aggregate_summary=AsyncMock(side_effect=[summary, summary]),
+        aggregate_daily_rows=AsyncMock(return_value=[]),
+        aggregate_by_model=AsyncMock(return_value=[]),
+        aggregate_by_account=AsyncMock(return_value=[]),
+        aggregate_by_useragent=AsyncMock(return_value=[]),
+        earliest_report_activity_at=AsyncMock(return_value=None),
+    )
+    service = ReportsService(cast(ReportsRepository, repo))
+
+    result = await service.get_reports(
+        start_date=start_date,
+        end_date=end_date,
+        report_timezone=report_timezone,
+    )
+
+    assert result.summary.avg_cost_per_day == 30.0
+    assert result.summary.avg_requests_per_day == 15.0
 
 
 @pytest.mark.asyncio
@@ -39,7 +106,37 @@ async def test_get_reports_rejects_oversized_range_after_applying_default_end_da
 
 
 @pytest.mark.asyncio
-async def test_get_reports_serializes_useragent_breakdown_and_model_request_counts() -> None:
+async def test_get_reports_rejects_inverted_defaulted_range_before_repository_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = SimpleNamespace(
+        aggregate_summary=AsyncMock(),
+        aggregate_daily_rows=AsyncMock(),
+        aggregate_by_model=AsyncMock(),
+        aggregate_by_account=AsyncMock(),
+        aggregate_by_useragent=AsyncMock(),
+        earliest_report_activity_at=AsyncMock(),
+    )
+    service = ReportsService(cast(ReportsRepository, repo))
+    fixed_now = datetime(2026, 6, 12, 12, 0, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.modules.reports.service.utcnow", lambda: fixed_now)
+
+    with pytest.raises(
+        InvalidReportDateRangeError,
+        match="start_date must be on or before end_date",
+    ):
+        await service.get_reports(start_date=date(2026, 6, 13))
+
+    repo.aggregate_summary.assert_not_awaited()
+    repo.aggregate_daily_rows.assert_not_awaited()
+    repo.aggregate_by_model.assert_not_awaited()
+    repo.aggregate_by_account.assert_not_awaited()
+    repo.aggregate_by_useragent.assert_not_awaited()
+    repo.earliest_report_activity_at.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_reports_serializes_conversation_and_breakdown_request_counts() -> None:
     repo = SimpleNamespace(
         aggregate_summary=AsyncMock(
             side_effect=[
@@ -49,7 +146,9 @@ async def test_get_reports_serializes_useragent_breakdown_and_model_request_coun
                     total_output_tokens=6,
                     total_cached_tokens=2,
                     total_requests=2,
+                    conversation_count=1,
                     total_errors=0,
+                    total_cancelled=0,
                     active_accounts=1,
                 ),
                 SimpleNamespace(
@@ -58,7 +157,9 @@ async def test_get_reports_serializes_useragent_breakdown_and_model_request_coun
                     total_output_tokens=2,
                     total_cached_tokens=0,
                     total_requests=1,
+                    conversation_count=0,
                     total_errors=0,
+                    total_cancelled=0,
                     active_accounts=1,
                 ),
             ]
@@ -68,12 +169,14 @@ async def test_get_reports_serializes_useragent_breakdown_and_model_request_coun
                 SimpleNamespace(
                     date="2026-06-01",
                     requests=2,
+                    conversation_count=1,
                     input_tokens=12,
                     output_tokens=6,
                     cached_input_tokens=2,
                     cost_usd=1.2,
                     active_accounts=1,
                     error_count=0,
+                    cancelled_count=0,
                     median_ttft_ms=123.456,
                     median_tps=78.901,
                     median_queue_ms=45.678,
@@ -103,6 +206,7 @@ async def test_get_reports_serializes_useragent_breakdown_and_model_request_coun
         None,
         None,
         "opencode",
+        None,
     )
     repo.aggregate_daily_rows.assert_awaited_once_with(
         date(2026, 6, 1),
@@ -111,6 +215,7 @@ async def test_get_reports_serializes_useragent_breakdown_and_model_request_coun
         None,
         None,
         "opencode",
+        None,
     )
     repo.aggregate_by_model.assert_awaited_once_with(
         datetime(2026, 6, 1, 0, 0, 0),
@@ -118,6 +223,7 @@ async def test_get_reports_serializes_useragent_breakdown_and_model_request_coun
         None,
         None,
         "opencode",
+        None,
     )
     repo.aggregate_by_account.assert_awaited_once_with(
         datetime(2026, 6, 1, 0, 0, 0),
@@ -125,6 +231,7 @@ async def test_get_reports_serializes_useragent_breakdown_and_model_request_coun
         None,
         None,
         "opencode",
+        None,
     )
     repo.aggregate_by_useragent.assert_awaited_once_with(
         datetime(2026, 6, 1, 0, 0, 0),
@@ -132,13 +239,16 @@ async def test_get_reports_serializes_useragent_breakdown_and_model_request_coun
         None,
         None,
         "opencode",
+        None,
     )
-    repo.earliest_report_activity_at.assert_awaited_once_with(None, None, "opencode")
+    repo.earliest_report_activity_at.assert_awaited_once_with(None, None, "opencode", None)
 
     assert result.daily[0].median_ttft_ms == 123.46
+    assert result.daily[0].conversations == 1
     assert result.daily[0].median_tps == 78.9
     assert result.daily[0].median_queue_ms == 45.68
     assert result.by_model[0].model == "gpt-5.1"
+    assert result.summary.total_conversations == 1
     assert result.by_model[0].requests == 2
     assert result.by_useragent[0].useragent == "opencode"
     assert result.by_useragent[0].requests == 2

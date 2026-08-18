@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import select
@@ -9,11 +10,24 @@ from sqlalchemy.exc import ResourceClosedError
 
 from app.db.models import ModelSource, RequestLog
 from app.db.session import SessionLocal
+from app.modules.request_logs import repository as repository_module
 from app.modules.request_logs.repository import RequestLogsRepository
 
 
+@pytest.fixture(autouse=True)
+def _clear_recent_count_cache_between_tests():
+    repository_module._clear_recent_count_cache()
+    yield
+    repository_module._clear_recent_count_cache()
+
+
 @pytest.mark.asyncio
-async def test_add_log_ignores_closed_transaction(monkeypatch) -> None:
+async def test_add_log_ignores_closed_transaction(monkeypatch, db_setup) -> None:
+    # The insert now executes eagerly (Core insert instead of a unit-of-work
+    # flush inside commit), so the schema must exist; the contract under test
+    # is unchanged: a ResourceClosedError commit is swallowed and the built
+    # log row is still returned.
+    del db_setup
     async with SessionLocal() as session:
         repo = RequestLogsRepository(session)
 
@@ -43,7 +57,7 @@ async def test_add_log_ignores_closed_transaction(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_add_log_persists_request_kind(db_setup) -> None:
+async def test_add_log_persists_request_and_connection_kinds(db_setup) -> None:
     del db_setup
     async with SessionLocal() as session:
         repo = RequestLogsRepository(session)
@@ -58,11 +72,125 @@ async def test_add_log_persists_request_kind(db_setup) -> None:
             status="success",
             error_code=None,
             request_kind="warmup",
+            connection_request_kind="prewarm",
         )
 
         persisted = await session.scalar(select(RequestLog).where(RequestLog.id == saved.id))
         assert persisted is not None
         assert persisted.request_kind == "warmup"
+        assert persisted.connection_request_kind == "prewarm"
+
+
+@pytest.mark.asyncio
+async def test_add_log_persists_normalized_conversation_id(db_setup) -> None:
+    del db_setup
+    async with SessionLocal() as session:
+        repo = RequestLogsRepository(session)
+
+        saved = await repo.add_log(
+            account_id=None,
+            request_id="req_conversation",
+            model="gpt-5.2",
+            input_tokens=10,
+            output_tokens=5,
+            latency_ms=1,
+            status="success",
+            error_code=None,
+            conversation_id=" conv-a ",
+        )
+        empty = await repo.add_log(
+            account_id=None,
+            request_id="req_conversation_empty",
+            model="gpt-5.2",
+            input_tokens=10,
+            output_tokens=5,
+            latency_ms=1,
+            status="success",
+            error_code=None,
+            conversation_id=" ",
+        )
+
+        persisted = await session.scalar(select(RequestLog).where(RequestLog.id == saved.id))
+        empty_persisted = await session.scalar(select(RequestLog).where(RequestLog.id == empty.id))
+
+    assert persisted is not None
+    assert persisted.conversation_id == "conv-a"
+    assert empty_persisted is not None
+    assert empty_persisted.conversation_id is None
+
+
+@pytest.mark.asyncio
+async def test_aggregate_conversations_by_bucket_deduplicates_model_service_groups_and_excludes_warmups(
+    db_setup,
+) -> None:
+    del db_setup
+    since = datetime(2026, 7, 21, 0, 0, 0)
+    async with SessionLocal() as session:
+        repo = RequestLogsRepository(session)
+        for request_id, model, service_tier, conversation_id, request_kind in (
+            ("conversation_bucket_1", "gpt-5.1", None, "conv-a", "normal"),
+            ("conversation_bucket_2", "gpt-5.2", "priority", " conv-a ", "normal"),
+            ("conversation_bucket_3", "gpt-5.1", None, "conv-b", "normal"),
+            ("conversation_bucket_warmup", "gpt-5.1", None, "conv-warmup", "warmup"),
+        ):
+            await repo.add_log(
+                account_id=None,
+                request_id=request_id,
+                model=model,
+                service_tier=service_tier,
+                input_tokens=0,
+                output_tokens=0,
+                latency_ms=1,
+                status="success",
+                error_code=None,
+                conversation_id=conversation_id,
+                request_kind=request_kind,
+                requested_at=since + timedelta(minutes=5),
+            )
+
+        buckets = await repo.aggregate_conversations_by_bucket(since, bucket_seconds=3600)
+
+    assert [(bucket.bucket_epoch, bucket.conversation_count) for bucket in buckets] == [
+        (int(since.replace(tzinfo=timezone.utc).timestamp()), 2),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_aggregate_activity_counts_only_nonblank_conversation_requests(db_setup) -> None:
+    del db_setup
+    since = datetime(2026, 7, 21, 0, 0, 0)
+    until = since + timedelta(hours=1)
+
+    async with SessionLocal() as session:
+        repo = RequestLogsRepository(session)
+        for request_id, conversation_id, request_kind in (
+            ("conv-request-1", "conv-a", "normal"),
+            ("conv-request-2", " conv-a ", "normal"),
+            ("conv-request-3", "conv-b", "normal"),
+            ("conv-request-4", "conv-b", "normal"),
+            ("no-conversation-1", None, "normal"),
+            ("no-conversation-2", "   ", "normal"),
+            ("warmup-conversation", "conv-warmup", "warmup"),
+        ):
+            await repo.add_log(
+                account_id=None,
+                request_id=request_id,
+                model="gpt-5.2",
+                input_tokens=0,
+                output_tokens=0,
+                latency_ms=1,
+                status="success",
+                error_code=None,
+                conversation_id=conversation_id,
+                request_kind=request_kind,
+                requested_at=since + timedelta(minutes=5),
+            )
+
+        aggregate = await repo.aggregate_activity_between(since, until)
+
+    assert aggregate.request_count == 6
+    assert aggregate.conversation_count == 2
+    assert aggregate.conversation_request_count == 4
 
 
 @pytest.mark.asyncio
@@ -158,8 +286,6 @@ async def test_add_log_persists_ttft_phase_and_prewarm_fields(db_setup) -> None:
             latency_bridge_queue_wait_ms=40,
             prewarm_status="success",
             prewarm_latency_ms=120,
-            prewarm_canary_bucket="treatment",
-            prewarm_eligible_reason="first_turn_50k_gap_2m",
             session_previous_gap_ms=180000,
         )
 
@@ -173,8 +299,6 @@ async def test_add_log_persists_ttft_phase_and_prewarm_fields(db_setup) -> None:
     assert persisted.latency_bridge_queue_wait_ms == 40
     assert persisted.prewarm_status == "success"
     assert persisted.prewarm_latency_ms == 120
-    assert persisted.prewarm_canary_bucket == "treatment"
-    assert persisted.prewarm_eligible_reason == "first_turn_50k_gap_2m"
     assert persisted.session_previous_gap_ms == 180000
 
 
@@ -183,13 +307,14 @@ async def test_find_latest_account_id_for_response_id_prefers_session_then_falls
     session = AsyncMock()
     repo = RequestLogsRepository(session)
     executed_sql: list[str] = []
+    owner_requested_at = datetime(2026, 7, 11, 12, 0, 0)
     returned_values = iter(
         [
-            "acc_latest",
-            "acc_scoped",
-            "acc_session",
+            ("acc_latest", None, None),
+            ("acc_scoped", None, None),
+            ("acc_session", owner_requested_at, "sid_terminal_a"),
             None,
-            "acc_scoped",
+            ("acc_scoped", None, None),
             None,
         ]
     )
@@ -197,7 +322,7 @@ async def test_find_latest_account_id_for_response_id_prefers_session_then_falls
     async def _execute(statement):
         executed_sql.append(str(statement))
         value = next(returned_values)
-        return SimpleNamespace(scalar_one_or_none=lambda: value)
+        return SimpleNamespace(one_or_none=lambda: value)
 
     session.execute.side_effect = _execute
 
@@ -209,7 +334,7 @@ async def test_find_latest_account_id_for_response_id_prefers_session_then_falls
         response_id="resp_lookup_owner",
         api_key_id="api_key_1",
     )
-    owner_session = await repo.find_latest_account_id_for_response_id(
+    owner_session = await repo.find_latest_owner_record_for_response_id(
         response_id="resp_lookup_owner",
         api_key_id="api_key_1",
         session_id="sid_terminal_a",
@@ -226,7 +351,10 @@ async def test_find_latest_account_id_for_response_id_prefers_session_then_falls
 
     assert owner_any == "acc_latest"
     assert owner_scoped == "acc_scoped"
-    assert owner_session == "acc_session"
+    assert owner_session is not None
+    assert owner_session.account_id == "acc_session"
+    assert owner_session.requested_at == owner_requested_at
+    assert owner_session.session_id == "sid_terminal_a"
     assert owner_session_fallback == "acc_scoped"
     assert owner_missing is None
     assert "request_logs.api_key_id = :api_key_id_1" not in executed_sql[0]
@@ -259,7 +387,7 @@ async def test_find_latest_account_id_for_response_id_ignores_blank_session_id_s
 
     async def _execute(statement):
         executed_sql.append(str(statement))
-        return SimpleNamespace(scalar_one_or_none=lambda: "acc_scoped")
+        return SimpleNamespace(one_or_none=lambda: ("acc_scoped", None, None))
 
     session.execute.side_effect = _execute
 
@@ -279,11 +407,11 @@ async def test_find_latest_account_id_for_response_id_falls_back_when_session_sc
     session = AsyncMock()
     repo = RequestLogsRepository(session)
     executed_sql: list[str] = []
-    returned_values = iter(["   ", "acc_fallback"])
+    returned_values = iter([("   ", None, "sid_terminal_a"), ("acc_fallback", None, None)])
 
     async def _execute(statement):
         executed_sql.append(str(statement))
-        return SimpleNamespace(scalar_one_or_none=lambda: next(returned_values))
+        return SimpleNamespace(one_or_none=lambda: next(returned_values))
 
     session.execute.side_effect = _execute
 
@@ -297,3 +425,112 @@ async def test_find_latest_account_id_for_response_id_falls_back_when_session_sc
     assert len(executed_sql) == 2
     assert "request_logs.session_id = :session_id_1" in executed_sql[0]
     assert "request_logs.session_id = :session_id_1" not in executed_sql[1]
+
+
+def _conversation_count_session(count: int = 3) -> tuple[AsyncMock, list[str]]:
+    session = AsyncMock()
+    session.get_bind = MagicMock(return_value=SimpleNamespace(dialect=SimpleNamespace(name="sqlite")))
+    count_queries: list[str] = []
+
+    async def _execute(statement):
+        sql = str(statement)
+        if sql.lstrip().upper().startswith("SELECT COUNT"):
+            count_queries.append(sql)
+        return SimpleNamespace(scalar_one=lambda: count, all=lambda: [])
+
+    session.execute.side_effect = _execute
+    return session, count_queries
+
+
+@pytest.mark.asyncio
+async def test_conversation_count_cache_hits_for_same_timeframe(monkeypatch) -> None:
+    monkeypatch.setattr(repository_module, "_COUNT_CACHE_TTL_SECONDS", 30.0)
+    session, count_queries = _conversation_count_session()
+    repo = RequestLogsRepository(session)
+    since = datetime(2026, 7, 20, 12, 0, 0)
+
+    await repo.list_conversations(cache_mode="timeframe", timeframe="7d", since=since)
+    await repo.list_conversations(cache_mode="timeframe", timeframe="7d", since=since)
+
+    assert len(count_queries) == 1
+
+
+@pytest.mark.asyncio
+async def test_conversation_count_cache_normalizes_search_whitespace(monkeypatch) -> None:
+    monkeypatch.setattr(repository_module, "_COUNT_CACHE_TTL_SECONDS", 30.0)
+    session, count_queries = _conversation_count_session()
+    repo = RequestLogsRepository(session)
+    since = datetime(2026, 7, 20, 12, 0, 0)
+
+    await repo.list_conversations(cache_mode="timeframe", timeframe="7d", since=since, search=None)
+    await repo.list_conversations(cache_mode="timeframe", timeframe="7d", since=since, search="foo")
+    await repo.list_conversations(cache_mode="timeframe", timeframe="7d", since=since, search="  foo  ")
+
+    assert len(count_queries) == 2
+
+
+@pytest.mark.asyncio
+async def test_conversation_count_cache_misses_for_different_timeframe(monkeypatch) -> None:
+    monkeypatch.setattr(repository_module, "_COUNT_CACHE_TTL_SECONDS", 30.0)
+    session, count_queries = _conversation_count_session()
+    repo = RequestLogsRepository(session)
+    since = datetime(2026, 7, 20, 12, 0, 0)
+
+    await repo.list_conversations(cache_mode="timeframe", timeframe="7d", since=since)
+    await repo.list_conversations(cache_mode="timeframe", timeframe="30d", since=since)
+
+    assert len(count_queries) == 2
+
+
+@pytest.mark.asyncio
+async def test_conversation_count_cache_uses_legacy_since_identity(monkeypatch) -> None:
+    monkeypatch.setattr(repository_module, "_COUNT_CACHE_TTL_SECONDS", 30.0)
+    session, count_queries = _conversation_count_session()
+    repo = RequestLogsRepository(session)
+    first_since = datetime(2026, 7, 20, 12, 0, 0)
+    second_since = first_since - timedelta(hours=1)
+
+    await repo.list_conversations(cache_mode="since", since=first_since)
+    await repo.list_conversations(cache_mode="since", since=first_since)
+    await repo.list_conversations(cache_mode="since", since=second_since)
+
+    assert len(count_queries) == 2
+
+
+@pytest.mark.asyncio
+async def test_conversation_count_cache_namespaces_timeframe_and_since_modes(monkeypatch) -> None:
+    monkeypatch.setattr(repository_module, "_COUNT_CACHE_TTL_SECONDS", 30.0)
+    session, count_queries = _conversation_count_session()
+    repo = RequestLogsRepository(session)
+    now = datetime(2026, 7, 27, 12, 0, 0)
+    thirty_days_ago = now - timedelta(days=30)
+
+    await repo.list_conversations(cache_mode="timeframe", timeframe="30d", since=thirty_days_ago)
+    await repo.list_conversations(cache_mode="since", since=thirty_days_ago)
+
+    assert len(count_queries) == 2
+
+
+@pytest.mark.asyncio
+async def test_conversation_count_cache_evicts_oldest_entry_at_256_entries(monkeypatch) -> None:
+    monkeypatch.setattr(repository_module, "_COUNT_CACHE_TTL_SECONDS", 30.0)
+    session, count_queries = _conversation_count_session(count=7)
+    repo = RequestLogsRepository(session)
+    since = datetime(2026, 7, 20, 12, 0, 0)
+
+    for index in range(257):
+        await repo.list_conversations(
+            cache_mode="timeframe",
+            timeframe="7d",
+            since=since,
+            search=f"conversation-{index}",
+        )
+    result = await repo.list_conversations(
+        cache_mode="timeframe",
+        timeframe="7d",
+        since=since,
+        search="conversation-0",
+    )
+
+    assert result.total == 7
+    assert len(count_queries) == 258

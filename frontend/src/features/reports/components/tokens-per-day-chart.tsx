@@ -1,3 +1,5 @@
+import { useTranslation } from "react-i18next";
+
 import {
   AreaChart,
   Area,
@@ -10,6 +12,7 @@ import {
 import type { DailyReportRow } from "../schemas";
 import { buildContinuousDailyRows } from "../daily-series";
 import { ChartTooltip } from "./chart-tooltip";
+import { ReportChartCard } from "./report-chart-card";
 
 export type TokensPerDayChartProps = {
   startDate: string;
@@ -25,6 +28,7 @@ function formatTokens(v: number): string {
 }
 
 export function TokensPerDayChart({ startDate, endDate, data }: TokensPerDayChartProps) {
+  const { t } = useTranslation();
   const chartData = buildContinuousDailyRows(startDate, endDate, data).map((d) => ({
     date: d.date.slice(5),
     input: d.inputTokens,
@@ -32,9 +36,7 @@ export function TokensPerDayChart({ startDate, endDate, data }: TokensPerDayChar
   }));
 
   return (
-    <div className="rounded-xl border bg-card p-5">
-      <div className="text-sm font-semibold text-foreground">Tokens by Day</div>
-      <div className="mt-4 h-[200px]">
+    <ReportChartCard title={t("reports.charts.tokensByDay")} empty={data.length === 0}>
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart data={chartData} margin={{ top: 5, right: 10, left: 10, bottom: 0 }}>
             <defs>
@@ -61,7 +63,7 @@ export function TokensPerDayChart({ startDate, endDate, data }: TokensPerDayChar
               tickFormatter={formatTokens}
             />
             <Tooltip
-              content={<ChartTooltip names={{ input: "Input", output: "Output" }} formatValue={(v) => formatTokens(v)} />}
+              content={<ChartTooltip names={{ input: t("reports.charts.input"), output: t("reports.charts.output") }} formatValue={(v) => formatTokens(v)} />}
             />
             <Area
               type="monotone"
@@ -83,7 +85,6 @@ export function TokensPerDayChart({ startDate, endDate, data }: TokensPerDayChar
             />
           </AreaChart>
         </ResponsiveContainer>
-      </div>
-    </div>
+    </ReportChartCard>
   );
 }

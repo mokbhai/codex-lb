@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 from collections import deque
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -11,6 +12,7 @@ import anyio
 import pytest
 
 from app.core.crypto import TokenEncryptor
+from app.modules.api_keys.service import ApiKeyData
 from app.modules.proxy._service.support import (
     _REQUEST_TRANSPORT_HTTP,
     _REQUEST_TRANSPORT_WEBSOCKET,
@@ -25,6 +27,7 @@ class _DummyWebSocketService(_WebSocketMixin):
     def __init__(self) -> None:
         self.request_log_calls: list[dict[str, object]] = []
         self.remembered_response_ids: list[str] = []
+        self._background_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._encryptor = TokenEncryptor()
 
         class _LoadBalancer:
@@ -206,6 +209,9 @@ async def test_websocket_finalizer_records_bridge_upstream_transport_and_metric(
             "status": "success",
             "error_code": None,
             "error_message": None,
+            "failure_phase": None,
+            "failure_detail": None,
+            "upstream_error_code": None,
             "input_tokens": None,
             "output_tokens": None,
             "cached_input_tokens": None,
@@ -223,8 +229,6 @@ async def test_websocket_finalizer_records_bridge_upstream_transport_and_metric(
             "latency_bridge_queue_wait_ms": None,
             "prewarm_status": None,
             "prewarm_latency_ms": None,
-            "prewarm_canary_bucket": None,
-            "prewarm_eligible_reason": None,
             "session_previous_gap_ms": None,
             "session_id": None,
             "upstream_proxy_route_mode": None,
@@ -234,8 +238,10 @@ async def test_websocket_finalizer_records_bridge_upstream_transport_and_metric(
             "upstream_proxy_fail_closed_reason": None,
             "useragent": None,
             "useragent_group": None,
+            "conversation_id": None,
             "client_ip": None,
             "request_kind": "normal",
+            "connection_request_kind": None,
         }
     ]
     assert metric_calls == [
@@ -290,6 +296,9 @@ async def test_websocket_connect_failure_records_bridge_upstream_transport_and_m
             "status": "error",
             "error_code": "upstream_unavailable",
             "error_message": "bridge upstream failed",
+            "failure_phase": None,
+            "failure_detail": None,
+            "upstream_error_code": None,
             "reasoning_effort": None,
             "transport": "http",
             "upstream_transport": "websocket",
@@ -303,8 +312,6 @@ async def test_websocket_connect_failure_records_bridge_upstream_transport_and_m
             "latency_bridge_queue_wait_ms": None,
             "prewarm_status": None,
             "prewarm_latency_ms": None,
-            "prewarm_canary_bucket": None,
-            "prewarm_eligible_reason": None,
             "session_previous_gap_ms": None,
             "session_id": None,
             "upstream_proxy_route_mode": None,
@@ -314,8 +321,10 @@ async def test_websocket_connect_failure_records_bridge_upstream_transport_and_m
             "upstream_proxy_fail_closed_reason": None,
             "useragent": None,
             "useragent_group": None,
+            "conversation_id": None,
             "client_ip": None,
             "request_kind": "normal",
+            "connection_request_kind": None,
         }
     ]
 
@@ -364,6 +373,9 @@ async def test_fail_pending_websocket_requests_records_bridge_upstream_transport
             "status": "error",
             "error_code": "stream_incomplete",
             "error_message": "Upstream websocket closed before response.completed",
+            "failure_phase": None,
+            "failure_detail": None,
+            "upstream_error_code": None,
             "reasoning_effort": None,
             "transport": "http",
             "upstream_transport": "websocket",
@@ -379,8 +391,10 @@ async def test_fail_pending_websocket_requests_records_bridge_upstream_transport
             "upstream_proxy_fail_closed_reason": None,
             "useragent": None,
             "useragent_group": None,
+            "conversation_id": None,
             "client_ip": None,
             "request_kind": "normal",
+            "connection_request_kind": None,
         }
     ]
     assert metric_calls == [
@@ -392,3 +406,52 @@ async def test_fail_pending_websocket_requests_records_bridge_upstream_transport
             "status": "error",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_fail_pending_websocket_requests_attributes_request_state_api_key(monkeypatch):
+    """Bridge failure fan-out passes api_key=None at the session level; each
+    pending request's log row must still be attributed to that request's own
+    authenticated key (request_state.api_key)."""
+    service = _DummyWebSocketService()
+    monkeypatch.setattr(websocket_mixin_module, "_record_upstream_transport_decision", lambda **_labels: None)
+
+    request_key = ApiKeyData(
+        id="key_bridge_pending",
+        name="bridge-key",
+        key_prefix="sk-bridge",
+        allowed_models=None,
+        enforced_model=None,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        last_used_at=None,
+    )
+    request_state = _WebSocketRequestState(
+        request_id="ws_bridge_pending_key",
+        request_log_id="resp_bridge_pending_key_log",
+        response_id="resp_bridge_pending_key",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        api_key=request_key,
+        started_at=time.monotonic(),
+        transport=_REQUEST_TRANSPORT_HTTP,
+        upstream_transport=_REQUEST_TRANSPORT_WEBSOCKET,
+    )
+
+    await service._fail_pending_websocket_requests(
+        account_id_value="acc_bridge",
+        pending_requests=deque([request_state]),
+        pending_lock=anyio.Lock(),
+        error_code="stream_incomplete",
+        error_message="Upstream websocket closed before response.completed",
+        api_key=None,
+        response_create_gate=asyncio.Semaphore(1),
+    )
+
+    assert len(service.request_log_calls) == 1
+    assert service.request_log_calls[0]["api_key"] is request_key

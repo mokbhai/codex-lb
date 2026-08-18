@@ -188,6 +188,34 @@ describe("buildSettingsUpdateRequest", () => {
     expect(payload.limitWarmupIdleThresholdPercent).toBe(2.5);
   });
 
+  it("includes reset-credit setting updates", () => {
+    const settings = DashboardSettingsSchema.parse({
+      stickyThreadsEnabled: true,
+      upstreamStreamTransport: "default",
+      preferEarlierResetAccounts: false,
+      routingStrategy: "round_robin",
+      openaiCacheAffinityMaxAgeSeconds: 300,
+      dashboardSessionTtlSeconds: 43200,
+      importWithoutOverwrite: true,
+      totpRequiredOnLogin: true,
+      totpConfigured: false,
+      apiKeyAuthEnabled: true,
+      showResetCreditBadges: true,
+      autoRedeemResetCreditsBeforeExpiry: false,
+      showResetCreditExpiryBadge: true,
+    });
+
+    const payload = buildSettingsUpdateRequest(settings, {
+      showResetCreditBadges: false,
+      autoRedeemResetCreditsBeforeExpiry: true,
+      showResetCreditExpiryBadge: false,
+    });
+
+    expect(payload.showResetCreditBadges).toBe(false);
+    expect(payload.autoRedeemResetCreditsBeforeExpiry).toBe(true);
+    expect(payload.showResetCreditExpiryBadge).toBe(false);
+  });
+
   it("does not materialize inherited account capacity limits on unrelated updates", () => {
     const settings = DashboardSettingsSchema.parse({
       stickyThreadsEnabled: true,
@@ -199,6 +227,7 @@ describe("buildSettingsUpdateRequest", () => {
       proxyAccountResponseCreateLimit: 0,
       proxyAccountStreamLimit: 12,
       proxyAccountStreamRecoveryReserve: 2,
+      proxyApiKeyFairShareCongestionThresholdPct: 80,
       importWithoutOverwrite: true,
       totpRequiredOnLogin: true,
       totpConfigured: false,
@@ -211,6 +240,7 @@ describe("buildSettingsUpdateRequest", () => {
     expect(payload.proxyAccountResponseCreateLimit).toBeUndefined();
     expect(payload.proxyAccountStreamLimit).toBeUndefined();
     expect(payload.proxyAccountStreamRecoveryReserve).toBeUndefined();
+    expect(payload.proxyApiKeyFairShareCongestionThresholdPct).toBeUndefined();
   });
 
   it("includes all account capacity limits when they are explicitly edited", () => {
@@ -231,12 +261,14 @@ describe("buildSettingsUpdateRequest", () => {
       proxyAccountResponseCreateLimit: 0,
       proxyAccountStreamLimit: 12,
       proxyAccountStreamRecoveryReserve: 2,
+      proxyApiKeyFairShareCongestionThresholdPct: 80,
     });
 
     expect(payload).toMatchObject({
       proxyAccountResponseCreateLimit: 0,
       proxyAccountStreamLimit: 12,
       proxyAccountStreamRecoveryReserve: 2,
+      proxyApiKeyFairShareCongestionThresholdPct: 80,
     });
   });
 });

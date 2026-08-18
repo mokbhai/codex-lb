@@ -1,3 +1,5 @@
+import { useTranslation } from "react-i18next";
+
 import {
   AreaChart,
   Area,
@@ -10,6 +12,7 @@ import {
 import type { DailyReportRow } from "../schemas";
 import { buildContinuousDailyRows } from "../daily-series";
 import { ChartTooltip } from "./chart-tooltip";
+import { ReportChartCard } from "./report-chart-card";
 
 export type CostPerDayChartProps = {
   startDate: string;
@@ -18,15 +21,14 @@ export type CostPerDayChartProps = {
 };
 
 export function CostPerDayChart({ startDate, endDate, data }: CostPerDayChartProps) {
+  const { t } = useTranslation();
   const chartData = buildContinuousDailyRows(startDate, endDate, data).map((d) => ({
     date: d.date.slice(5),
     cost: d.costUsd,
   }));
 
   return (
-    <div className="rounded-xl border bg-card p-5">
-      <div className="text-sm font-semibold text-foreground">Cost by Day</div>
-      <div className="mt-4 h-[200px]">
+    <ReportChartCard title={t("reports.charts.costByDay")} empty={data.length === 0}>
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart data={chartData} margin={{ top: 5, right: 10, left: 10, bottom: 0 }}>
             <defs>
@@ -49,7 +51,7 @@ export function CostPerDayChart({ startDate, endDate, data }: CostPerDayChartPro
               tickFormatter={(v: number) => `$${v}`}
             />
             <Tooltip
-              content={<ChartTooltip names={{ cost: "Cost" }} formatValue={(v) => `$${v.toFixed(2)}`} />}
+              content={<ChartTooltip names={{ cost: t("reports.dailyBreakdown.columns.cost") }} formatValue={(v) => `$${v.toFixed(2)}`} />}
             />
             <Area
               type="monotone"
@@ -62,7 +64,6 @@ export function CostPerDayChart({ startDate, endDate, data }: CostPerDayChartPro
             />
           </AreaChart>
         </ResponsiveContainer>
-      </div>
-    </div>
+    </ReportChartCard>
   );
 }

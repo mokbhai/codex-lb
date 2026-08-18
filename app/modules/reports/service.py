@@ -17,6 +17,10 @@ from app.modules.reports.schemas import (
 )
 
 
+class InvalidReportDateRangeError(ValueError):
+    """Raised when a report starts after it ends."""
+
+
 class ReportsService:
     def __init__(self, repository: ReportsRepository) -> None:
         self._repository = repository
@@ -29,6 +33,7 @@ class ReportsService:
         account_ids: list[str] | None = None,
         model: str | None = None,
         useragent_group: str | None = None,
+        api_key_ids: list[str] | None = None,
     ) -> ReportsResponse:
         timezone_info = _resolve_timezone(report_timezone)
         now = utcnow().replace(tzinfo=timezone.utc).astimezone(timezone_info)
@@ -36,27 +41,33 @@ class ReportsService:
             end_date = now.date()
         if start_date is None:
             start_date = end_date - timedelta(days=6)
+        if start_date > end_date:
+            raise InvalidReportDateRangeError("start_date must be on or before end_date")
         window_days = (end_date - start_date).days + 1
         if window_days > MAX_DAILY_REPORT_DAYS:
             raise DailyReportRangeTooLargeError(f"report date range must be {MAX_DAILY_REPORT_DAYS} days or less")
 
         start_at = _local_midnight_to_utc_naive(start_date, timezone_info)
         end_at = _local_midnight_to_utc_naive(end_date + timedelta(days=1), timezone_info)
-        window_days = max(window_days, 1)
         previous_end_date = start_date - timedelta(days=1)
         previous_start_date = previous_end_date - timedelta(days=window_days - 1)
         previous_start_at = _local_midnight_to_utc_naive(previous_start_date, timezone_info)
         previous_end_at = _local_midnight_to_utc_naive(previous_end_date + timedelta(days=1), timezone_info)
 
-        summary = await self._repository.aggregate_summary(start_at, end_at, account_ids, model, useragent_group)
+        summary = await self._repository.aggregate_summary(
+            start_at, end_at, account_ids, model, useragent_group, api_key_ids
+        )
         previous_summary = await self._repository.aggregate_summary(
             previous_start_at,
             previous_end_at,
             account_ids,
             model,
             useragent_group,
+            api_key_ids,
         )
-        earliest_activity_at = await self._repository.earliest_report_activity_at(account_ids, model, useragent_group)
+        earliest_activity_at = await self._repository.earliest_report_activity_at(
+            account_ids, model, useragent_group, api_key_ids
+        )
         daily_rows = await self._repository.aggregate_daily_rows(
             start_date,
             end_date,
@@ -64,6 +75,7 @@ class ReportsService:
             account_ids,
             model,
             useragent_group,
+            api_key_ids,
         )
         daily = [
             DailyReportRow(
@@ -74,24 +86,29 @@ class ReportsService:
                 cached_input_tokens=row.cached_input_tokens,
                 cost_usd=round(row.cost_usd, 4),
                 active_accounts=row.active_accounts,
+                conversations=row.conversation_count,
                 error_count=row.error_count,
+                cancelled_count=row.cancelled_count,
                 median_ttft_ms=round(row.median_ttft_ms, 2),
                 median_tps=round(row.median_tps, 2),
                 median_queue_ms=round(row.median_queue_ms, 2),
             )
             for row in daily_rows
         ]
-        by_model = await self._repository.aggregate_by_model(start_at, end_at, account_ids, model, useragent_group)
-        by_account = await self._repository.aggregate_by_account(start_at, end_at, account_ids, model, useragent_group)
+        by_model = await self._repository.aggregate_by_model(
+            start_at, end_at, account_ids, model, useragent_group, api_key_ids
+        )
+        by_account = await self._repository.aggregate_by_account(
+            start_at, end_at, account_ids, model, useragent_group, api_key_ids
+        )
         by_useragent = await self._repository.aggregate_by_useragent(
             start_at,
             end_at,
             account_ids,
             model,
             useragent_group,
+            api_key_ids,
         )
-
-        day_count = max((end_at.date() - start_at.date()).days, 1)
 
         model_total = sum(m.cost_usd for m in by_model)
         useragent_total = sum(u.cost_usd for u in by_useragent)
@@ -112,9 +129,11 @@ class ReportsService:
                 total_cached_tokens=summary.total_cached_tokens,
                 total_requests=summary.total_requests,
                 total_errors=summary.total_errors,
+                total_cancelled=summary.total_cancelled,
                 active_accounts=summary.active_accounts,
-                avg_cost_per_day=round(summary.total_cost_usd / day_count, 4),
-                avg_requests_per_day=round(summary.total_requests / day_count, 2),
+                total_conversations=summary.conversation_count,
+                avg_cost_per_day=round(summary.total_cost_usd / window_days, 4),
+                avg_requests_per_day=round(summary.total_requests / window_days, 2),
             ),
             comparison=comparison,
             daily=daily,

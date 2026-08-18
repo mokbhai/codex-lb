@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from sqlalchemy import delete, func, select
 
 from app.core.config.settings import get_settings
+from app.core.config.settings_cache import get_settings_cache
 from app.core.utils.time import utcnow
 from app.db.models import AccountUsageRollupState, AdditionalUsageHistory, RequestLog, UsageHistory
 from app.db.session import get_background_session, sqlite_writer_section
@@ -19,16 +21,49 @@ logger = logging.getLogger(__name__)
 BATCH_SIZE = 10_000
 
 
+@dataclass(frozen=True, slots=True)
+class EffectiveRetention:
+    request_log_days: int
+    usage_history_days: int
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.request_log_days or self.usage_history_days)
+
+
+async def get_effective_retention() -> EffectiveRetention:
+    """Resolve the retention windows with dashboard-first precedence.
+
+    A non-NULL dashboard value (SettingsCache-backed, so a dashboard change
+    takes effect without restart) wins; while the dashboard value is unset the
+    deprecated env alias applies; 0 means disabled at either layer.
+    """
+    env = get_settings()
+    dashboard = await get_settings_cache().get()
+    return EffectiveRetention(
+        request_log_days=(
+            env.request_log_retention_days
+            if dashboard.request_log_retention_days is None
+            else dashboard.request_log_retention_days
+        ),
+        usage_history_days=(
+            env.usage_history_retention_days
+            if dashboard.usage_history_retention_days is None
+            else dashboard.usage_history_retention_days
+        ),
+    )
+
+
 async def run_retention_pass(*, now: datetime | None = None) -> dict[str, int]:
-    """Prune aged rows per the retention settings. Returns rows deleted per table."""
-    settings = get_settings()
+    """Prune aged rows per the effective retention settings. Returns rows deleted per table."""
+    retention = await get_effective_retention()
     now = now or utcnow()
     deleted = {"request_logs": 0, "usage_history": 0, "additional_usage_history": 0}
-    if settings.request_log_retention_days:
-        cutoff = now - timedelta(days=settings.request_log_retention_days)
+    if retention.request_log_days:
+        cutoff = now - timedelta(days=retention.request_log_days)
         deleted["request_logs"] = await _prune_request_logs(cutoff, now=now)
-    if settings.usage_history_retention_days:
-        cutoff = now - timedelta(days=settings.usage_history_retention_days)
+    if retention.usage_history_days:
+        cutoff = now - timedelta(days=retention.usage_history_days)
         deleted["usage_history"] = await _prune_usage_history(cutoff)
         deleted["additional_usage_history"] = await _prune_additional_usage_history(cutoff)
     total = sum(deleted.values())
@@ -49,6 +84,14 @@ async def _prune_request_logs(cutoff: datetime, *, now: datetime) -> int:
     exists only in the live table, so pruning them would silently shrink
     lifetime account totals. No watermark (fold never ran) means skip.
 
+    The effective watermark is the MIN of the lifetime fold watermark and the
+    hourly and conversation time-axis watermarks: a raw row is only prunable
+    once EVERY rollup that must outlive it has folded it. While either
+    time-axis backfill is catching up (each watermark starts at the epoch),
+    the min fails the currency check below and pruning pauses entirely — the
+    pre-existing "never delete what is not folded" invariant extended to the
+    time-axis rollups.
+
     Pruning also requires the fold to be CURRENT (watermark within two fold
     lags of now) and stays a full fold lag below it. Summary reads load the
     watermark and the live tail in separate statements; a fold committing
@@ -64,11 +107,28 @@ async def _prune_request_logs(cutoff: datetime, *, now: datetime) -> int:
     while True:
         async with get_background_session() as session:
             async with sqlite_writer_section():
-                watermark = (
+                # FOR UPDATE: the batch's prune decision must serialize with
+                # anything mutating the fold state in another transaction —
+                # in particular the operator escape hatch (rollup truncate +
+                # watermark reset). An unlocked read could capture the old
+                # watermark, the reset could commit, and this batch would
+                # then prune raw rows whose folded statistics were just
+                # truncated — recoverable from neither side. With the row
+                # lock held through the batch, the reset either commits
+                # first (this read sees the epoch watermark and pruning
+                # pauses) or waits until the batch's delete has committed.
+                watermarks = (
                     await session.execute(
-                        select(AccountUsageRollupState.folded_through).where(AccountUsageRollupState.id == 1)
+                        select(
+                            AccountUsageRollupState.folded_through,
+                            AccountUsageRollupState.hourly_folded_through,
+                            AccountUsageRollupState.conversation_folded_through,
+                        )
+                        .where(AccountUsageRollupState.id == 1)
+                        .with_for_update()
                     )
-                ).scalar_one_or_none()
+                ).first()
+                watermark = min(watermarks) if watermarks is not None else None
                 if watermark is None:
                     if total == 0:
                         logger.info("Retention: skipping request_logs pruning (no rollup watermark yet)")
@@ -81,8 +141,16 @@ async def _prune_request_logs(cutoff: datetime, *, now: datetime) -> int:
                         )
                     return total
                 effective_cutoff = min(cutoff, watermark - FOLD_LAG)
+                # Oldest-first batches keep min(requested_at) a contiguous
+                # retention frontier: an interrupted pass never leaves
+                # deleted holes above the oldest surviving row, which the
+                # rollup-served listing count relies on when clamping its
+                # folded window to listable history.
                 batch_ids = (
-                    select(RequestLog.id).where(RequestLog.requested_at < effective_cutoff).limit(BATCH_SIZE)
+                    select(RequestLog.id)
+                    .where(RequestLog.requested_at < effective_cutoff)
+                    .order_by(RequestLog.requested_at.asc(), RequestLog.id.asc())
+                    .limit(BATCH_SIZE)
                 ).scalar_subquery()
                 result = await session.execute(
                     delete(RequestLog).where(RequestLog.id.in_(batch_ids)).returning(RequestLog.id)

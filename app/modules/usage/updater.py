@@ -8,7 +8,7 @@ import time
 from collections.abc import Awaitable, Callable, Collection, Hashable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Mapping, Protocol, cast
+from typing import Final, Mapping, Protocol, cast
 
 from app.core import usage as usage_core
 from app.core.auth.refresh import RefreshError
@@ -17,6 +17,7 @@ from app.core.balancer import (
     QUOTA_EXCEEDED_COOLDOWN_SECONDS,
     RATE_LIMITED_MIN_COOLDOWN_SECONDS,
     account_status_for_permanent_failure,
+    plausible_rate_limit_reset_at,
 )
 from app.core.clients.usage import UsageFetchError, fetch_usage
 from app.core.config.settings import get_settings
@@ -34,7 +35,13 @@ from app.modules.accounts.repository import AccountsRepository as SessionAccount
 from app.modules.proxy.account_cache import get_account_selection_cache, mark_account_routing_unavailable
 from app.modules.usage.additional_quota_keys import canonicalize_additional_quota_key
 from app.modules.usage.background_repository import BackgroundAdditionalUsageRepository, BackgroundUsageRepository
-from app.modules.usage.repository import AdditionalUsageRepository
+from app.modules.usage.plan_downgrade_observations import (
+    InMemoryPlanDowngradeObservationStore,
+    PlanDowngradeObservationStorePort,
+    credential_fingerprint,
+    get_plan_downgrade_observation_store,
+)
+from app.modules.usage.repository import AdditionalUsageRepository, UsageWindowWrite
 from app.modules.usage.repository import UsageRepository as SessionUsageRepository
 
 logger = logging.getLogger(__name__)
@@ -48,20 +55,13 @@ class UsageRepositoryPort(Protocol):
         window: str | None = None,
     ) -> UsageHistory | None: ...
 
-    async def add_entry(
+    async def add_account_snapshot(
         self,
         account_id: str,
-        used_percent: float,
-        input_tokens: int | None = None,
-        output_tokens: int | None = None,
+        windows: Collection[UsageWindowWrite],
+        *,
         recorded_at: datetime | None = None,
-        window: str | None = None,
-        reset_at: int | None = None,
-        window_minutes: int | None = None,
-        credits_has: bool | None = None,
-        credits_unlimited: bool | None = None,
-        credits_balance: float | None = None,
-    ) -> UsageHistory | None: ...
+    ) -> list[UsageHistory]: ...
 
 
 class AdditionalUsageRepositoryPort(Protocol):
@@ -152,6 +152,22 @@ class _MergedAdditionalWindow:
 # process. Updated only after a successful refresh that wrote data.
 _last_successful_refresh: dict[str, datetime] = {}
 _usage_refresh_auth_cooldowns: dict[str, float] = {}
+
+# Fallback for consecutive workspace-less "free" observations (issue #1456) used
+# only when persistence is explicitly disabled -- the DB-less unit-test harness.
+# The process default is the database-backed
+# :class:`PlanDowngradeObservationStore`, so the observation sequence stays
+# coherent across replicas sharing one database; this fallback preserves
+# single-process behavior instead of dropping the guard when no database is
+# available.
+_FALLBACK_PLAN_DOWNGRADE_OBSERVATIONS = InMemoryPlanDowngradeObservationStore()
+
+# Number of consecutive agreeing observations required before a workspace-less
+# paid -> free downgrade is persisted. Deliberately a constant rather than a
+# CODEX_LB_* setting: two observations is the minimum that distinguishes a real
+# expiry from a single degraded response, and operators gain nothing from tuning
+# it (PRINCIPLES.md P2, settings-surface ratchet in issue #1340).
+_FREE_PLAN_DOWNGRADE_CONFIRMATIONS: Final[int] = 2
 
 
 class _UsageRefreshSingleflight:
@@ -364,11 +380,26 @@ class UsageUpdater:
         access_token_override: str | None = None,
     ) -> bool:
         """Refresh one account regardless of cached/fresh usage rows."""
+        result = await self.force_refresh_result(
+            account,
+            ignore_refresh_disabled=ignore_refresh_disabled,
+            access_token_override=access_token_override,
+        )
+        return result.usage_written
+
+    async def force_refresh_result(
+        self,
+        account: Account,
+        *,
+        ignore_refresh_disabled: bool = False,
+        access_token_override: str | None = None,
+    ) -> AccountRefreshResult:
+        """Refresh one account and expose whether the upstream fetch completed."""
         settings = get_settings()
         if not settings.usage_refresh_enabled and not ignore_refresh_disabled:
-            return False
+            return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
         if account.status in (AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED):
-            return False
+            return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
         try:
             result = await _USAGE_REFRESH_SINGLEFLIGHT.run(
                 account.id,
@@ -383,7 +414,7 @@ class UsageUpdater:
             if result.fetch_succeeded:
                 _last_successful_refresh[account.id] = utcnow()
                 _clear_usage_refresh_auth_cooldown(account.id)
-            return result.usage_written
+            return result
         except Exception as exc:
             logger.warning(
                 "Forced usage refresh failed account_id=%s request_id=%s error=%s",
@@ -392,7 +423,7 @@ class UsageUpdater:
                 exc,
                 exc_info=True,
             )
-            return False
+            return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
 
     async def _refresh_account_if_stale(
         self,
@@ -472,7 +503,7 @@ class UsageUpdater:
             return False
         if (
             latest is not None
-            and (newest.recorded_at - latest.recorded_at).total_seconds() <= _SIBLING_FETCH_MARGIN_SECONDS
+            and (newest.recorded_at - latest.recorded_at).total_seconds() <= usage_core.SIBLING_FETCH_MARGIN_SECONDS
         ):
             return False
         if not _latest_usage_is_fresh(newest, now=now, interval_seconds=interval_seconds):
@@ -577,7 +608,7 @@ class UsageUpdater:
         if payload is None:
             return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
 
-        if _payload_mismatches_account_slot(account, payload):
+        if await _payload_mismatches_account_slot(account, payload):
             logger.warning(
                 "Usage refresh payload identity mismatch; skipping account mutation "
                 "account_id=%s stored_workspace_id=%s payload_workspace_id=%s stored_plan_type=%s "
@@ -674,49 +705,49 @@ class UsageUpdater:
             additional_synced = self._additional_usage_repo is not None and payload.additional_rate_limits is not None
             return AccountRefreshResult(usage_written=additional_synced)
         credits_has, credits_unlimited, credits_balance = _credits_snapshot(payload)
-        usage_written = False
+        snapshot_windows: list[UsageWindowWrite] = []
 
         if primary and primary.used_percent is not None:
-            entry = await self._usage_repo.add_entry(
-                account_id=account.id,
-                used_percent=float(primary.used_percent),
-                input_tokens=None,
-                output_tokens=None,
-                window="primary",
-                reset_at=_reset_at(primary.reset_at, primary.reset_after_seconds, now_epoch),
-                window_minutes=_window_minutes(primary.limit_window_seconds),
-                credits_has=credits_has,
-                credits_unlimited=credits_unlimited,
-                credits_balance=credits_balance,
+            snapshot_windows.append(
+                UsageWindowWrite(
+                    window="primary",
+                    used_percent=float(primary.used_percent),
+                    reset_at=_reset_at(primary.reset_at, primary.reset_after_seconds, now_epoch),
+                    window_minutes=_window_minutes(primary.limit_window_seconds),
+                    credits_has=credits_has,
+                    credits_unlimited=credits_unlimited,
+                    credits_balance=credits_balance,
+                )
             )
-            usage_written = usage_written or _usage_entry_written(entry)
 
         if secondary and secondary.used_percent is not None:
-            entry = await self._usage_repo.add_entry(
-                account_id=account.id,
-                used_percent=float(secondary.used_percent),
-                input_tokens=None,
-                output_tokens=None,
-                window="secondary",
-                reset_at=_reset_at(secondary.reset_at, secondary.reset_after_seconds, now_epoch),
-                window_minutes=_window_minutes(secondary.limit_window_seconds),
+            snapshot_windows.append(
+                UsageWindowWrite(
+                    window="secondary",
+                    used_percent=float(secondary.used_percent),
+                    reset_at=_reset_at(secondary.reset_at, secondary.reset_after_seconds, now_epoch),
+                    window_minutes=_window_minutes(secondary.limit_window_seconds),
+                )
             )
-            usage_written = usage_written or _usage_entry_written(entry)
 
         if monthly and monthly.used_percent is not None:
-            entry = await self._usage_repo.add_entry(
-                account_id=account.id,
-                used_percent=float(monthly.used_percent),
-                input_tokens=None,
-                output_tokens=None,
-                window="monthly",
-                reset_at=_reset_at(monthly.reset_at, monthly.reset_after_seconds, now_epoch),
-                window_minutes=_window_minutes(monthly.limit_window_seconds),
-                credits_has=credits_has,
-                credits_unlimited=credits_unlimited,
-                credits_balance=credits_balance,
+            snapshot_windows.append(
+                UsageWindowWrite(
+                    window="monthly",
+                    used_percent=float(monthly.used_percent),
+                    reset_at=_reset_at(monthly.reset_at, monthly.reset_after_seconds, now_epoch),
+                    window_minutes=_window_minutes(monthly.limit_window_seconds),
+                    credits_has=credits_has,
+                    credits_unlimited=credits_unlimited,
+                    credits_balance=credits_balance,
+                )
             )
-            usage_written = usage_written or _usage_entry_written(entry)
+
+        entries = await self._usage_repo.add_account_snapshot(
+            account.id,
+            snapshot_windows,
+        )
+        usage_written = any(_usage_entry_written(entry) for entry in entries)
         await self._recover_quota_status_from_usage(account, primary=primary, secondary=secondary, monthly=monthly)
         return AccountRefreshResult(usage_written=usage_written)
 
@@ -818,12 +849,11 @@ class UsageUpdater:
                 # ended: throttles are not always quota-based. Rows without
                 # blocked_at are stale window-derived markings and keep the
                 # fresh-usage recovery below.
-                cooldown_deadline = (
-                    float(account.reset_at)
-                    if account.reset_at
-                    else float(account.blocked_at) + RATE_LIMITED_MIN_COOLDOWN_SECONDS
+                now = time.time()
+                cooldown_deadline = plausible_rate_limit_reset_at(account.reset_at, now=now) or (
+                    float(account.blocked_at) + RATE_LIMITED_MIN_COOLDOWN_SECONDS
                 )
-                if time.time() < cooldown_deadline:
+                if now < cooldown_deadline:
                     return
             long_window = monthly or secondary
             if primary is None and monthly is None:
@@ -920,11 +950,13 @@ def _credits_snapshot(payload: UsagePayload) -> tuple[bool | None, bool | None, 
     return credits_has, credits_unlimited, _parse_credits_balance(balance_value)
 
 
-def _payload_mismatches_account_slot(account: Account, payload: UsagePayload) -> bool:
+async def _payload_mismatches_account_slot(account: Account, payload: UsagePayload) -> bool:
     payload_workspace_id = _clean_optional(payload.workspace_id)
     if account.workspace_id and payload_workspace_id and account.workspace_id != payload_workspace_id:
         # The payload reports a different workspace slot than the one this
         # account is bound to; refuse to write another workspace's usage/plan.
+        # This guard is unconditional: repetition never makes a conflicting
+        # workspace identity trustworthy.
         return True
     if not payload_workspace_id and payload.plan_type:
         payload_plan_type = coerce_account_plan_type(payload.plan_type, account.plan_type or "free")
@@ -948,8 +980,107 @@ def _payload_mismatches_account_slot(account: Account, payload: UsagePayload) ->
                 and payload_plan_type in recognized_paid_plans
             )
         ):
+            # A subscription that expires reports "free" every cycle from that
+            # account's own token, so an agreeing repeat observation is no
+            # longer the single-sample degraded signature above. Persist the
+            # downgrade only once it has been confirmed (issue #1456).
+            if await _free_plan_downgrade_is_confirmed(
+                account,
+                stored_plan_type=stored_plan_type,
+                normalized_payload_plan_type=normalized_payload_plan_type,
+            ):
+                return False
             return True
+        if normalize_account_plan_type(payload.plan_type) in (ACCOUNT_PLAN_TYPES - {"free"}):
+            # The account reports a recognized paid plan, which is positive
+            # evidence that it is still paid, so any pending downgrade evidence
+            # is discarded. An unrecognized value is absence of evidence and
+            # deliberately does not reach here.
+            await _clear_workspace_less_free_plan_observations(account.id)
     return False
+
+
+async def _free_plan_downgrade_is_confirmed(
+    account: Account,
+    *,
+    stored_plan_type: str,
+    normalized_payload_plan_type: str | None,
+) -> bool:
+    """Record a workspace-less paid -> free observation and report confirmation.
+
+    Only a recognized ``free`` payload against a recognized paid stored plan on a
+    workspace-less account is confirmable. Unrecognized plan values never
+    accumulate, so a degraded response reporting garbage can never downgrade an
+    account no matter how often it repeats.
+    """
+    if normalized_payload_plan_type != "free":
+        return False
+    if stored_plan_type not in (ACCOUNT_PLAN_TYPES - {"free"}):
+        return False
+    if account.workspace_id:
+        # The account is bound to a workspace, so a payload that omits
+        # ``workspace_id`` cannot establish that it describes this slot. A
+        # workspace-bound seat (Team/Business/Enterprise) must not be demoted to
+        # free on the strength of a payload that never names its workspace,
+        # however many times it repeats.
+        return False
+    fingerprint = credential_fingerprint(account)
+    store = _plan_downgrade_observation_store()
+    # One atomic step records the observation and returns the resulting count.
+    # The fingerprint digests the account's stable seat identity, not token
+    # material, so routine token rotation between two observations does not
+    # restart the sequence and a real expiry still converges (#1456). Credential
+    # replacement (re-import or in-place reauthentication) resets pending
+    # evidence at the replacement site itself -- the accounts repository
+    # discards it in the same transaction that applies the fresh material --
+    # while the fingerprint comparison here restarts the count for any
+    # remaining path that rebinds the row's seat identity. Doing this as a read
+    # followed by a write would leave an await between the two halves, letting
+    # concurrent refreshes for one account lose an increment.
+    observations = await store.observe(
+        account.id,
+        credential_fingerprint=fingerprint,
+        observed_plan_type="free",
+    )
+    if observations < _FREE_PLAN_DOWNGRADE_CONFIRMATIONS:
+        logger.info(
+            "Usage refresh observed a workspace-less downgrade to free; awaiting confirmation "
+            "account_id=%s stored_plan_type=%s observations=%s required=%s request_id=%s",
+            account.id,
+            stored_plan_type,
+            observations,
+            _FREE_PLAN_DOWNGRADE_CONFIRMATIONS,
+            get_request_id(),
+        )
+        return False
+    await store.clear(account.id)
+    logger.info(
+        "Usage refresh confirmed a workspace-less downgrade to free; persisting plan change "
+        "account_id=%s stored_plan_type=%s observations=%s request_id=%s",
+        account.id,
+        stored_plan_type,
+        observations,
+        get_request_id(),
+    )
+    return True
+
+
+def _plan_downgrade_observation_store() -> PlanDowngradeObservationStorePort:
+    """Resolve the shared store, falling back to process-local state.
+
+    The database-backed store is the process default so the observation sequence
+    is coherent across replicas. When persistence is explicitly disabled (the
+    DB-less unit-test harness), the fallback preserves the previous
+    single-process behavior rather than losing the guard entirely.
+    """
+    store = get_plan_downgrade_observation_store()
+    if store is not None:
+        return store
+    return _FALLBACK_PLAN_DOWNGRADE_OBSERVATIONS
+
+
+async def _clear_workspace_less_free_plan_observations(account_id: str) -> None:
+    await _plan_downgrade_observation_store().clear(account_id)
 
 
 def _clean_optional(value: str | None) -> str | None:
@@ -1141,11 +1272,6 @@ def _latest_usage_is_fresh(
     return True
 
 
-# Rows written by the same upstream fetch land within milliseconds of each
-# other; a sibling row only proves a *later* fetch (one that no longer
-# reported the stale window) when it is newer by more than this margin.
-_SIBLING_FETCH_MARGIN_SECONDS = 5.0
-
 _MAIN_USAGE_WINDOWS = ("primary", "secondary", "monthly")
 
 
@@ -1275,4 +1401,5 @@ def _prune_usage_refresh_auth_cooldowns() -> None:
 def _clear_usage_refresh_state() -> None:
     _usage_refresh_auth_cooldowns.clear()
     _last_successful_refresh.clear()
+    _FALLBACK_PLAN_DOWNGRADE_OBSERVATIONS.clear_all()
     _USAGE_REFRESH_SINGLEFLIGHT.clear()

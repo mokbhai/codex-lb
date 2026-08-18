@@ -5,8 +5,9 @@ from dataclasses import replace
 
 import pytest
 
-from app.core.openai.model_registry import ReasoningLevel, UpstreamModel, get_model_registry
+from app.core.openai.model_registry import ModelRegistryExport, ReasoningLevel, UpstreamModel, get_model_registry
 from app.core.types import JsonValue
+from app.modules.proxy import api as proxy_api
 
 pytestmark = pytest.mark.integration
 
@@ -95,6 +96,33 @@ async def _populate_test_registry() -> None:
         _make_upstream_model("gpt-5.3-codex"),
     ]
     await registry.update({"plus": models, "pro": models})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/models", "/backend-api/codex/models"])
+async def test_models_routes_release_reservation_when_catalog_read_fails(async_client, monkeypatch, path):
+    """Both public model routes settle their reservation on a catalog failure."""
+    released: list[str] = []
+
+    async def enforce(*args, **kwargs):
+        del args, kwargs
+        return type("Reservation", (), {"reservation_id": "models-route-failure"})()
+
+    async def release(reservation):
+        released.append(reservation.reservation_id)
+
+    async def boom(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("model_sources catalog read failed")
+
+    monkeypatch.setattr(proxy_api, "_enforce_request_limits", enforce)
+    monkeypatch.setattr(proxy_api, "_release_reservation_deferring_cancellation", release)
+    monkeypatch.setattr(proxy_api, "_list_enabled_source_catalog_models", boom)
+
+    with pytest.raises(RuntimeError, match="catalog read failed"):
+        await async_client.get(path)
+
+    assert released == ["models-route-failure"]
 
 
 async def _create_model_source(
@@ -246,10 +274,14 @@ async def test_backend_codex_models_uses_bootstrap_upstream_metadata(async_clien
     assert set(entries) == set(EXPECTED_BOOTSTRAP_MINIMAL_CLIENT_VERSIONS)
     for slug, expected_version in EXPECTED_BOOTSTRAP_MINIMAL_CLIENT_VERSIONS.items():
         assert entries[slug]["minimal_client_version"] == expected_version
+        assert entries[slug]["shell_type"] == "shell_command"
+        assert isinstance(entries[slug]["experimental_supported_tools"], list)
+        assert entries[slug]["truncation_policy"]["mode"] in {"bytes", "tokens"}
+        assert isinstance(entries[slug]["truncation_policy"]["limit"], int)
 
     sol = entries["gpt-5.6-sol"]
     assert sol["display_name"] == "GPT-5.6-Sol"
-    assert sol["context_window"] == 372_000
+    assert sol["context_window"] == 272_000
     assert sol["default_reasoning_level"] == "low"
     assert {level["effort"] for level in sol["supported_reasoning_levels"]} == {
         "low",
@@ -282,10 +314,11 @@ async def test_backend_codex_models_uses_bootstrap_upstream_metadata(async_clien
         "max",
     }
 
-    # Upstream-exact GPT-5.6 metadata as served on the Codex catalog wire
-    # (codex-rs/models-manager/models.json at rust-v0.144.1).
+    # Reproducible upstream catalog evidence:
+    # codex-rs/models-manager/models.json at rust-v0.145.0.
     for gpt56 in (sol, terra, luna):
         assert gpt56["minimal_client_version"] == "0.144.0"
+        assert gpt56["context_window"] == 272_000
         assert gpt56["tool_mode"] == "code_mode_only"
         assert gpt56["use_responses_lite"] is True
         assert gpt56["apply_patch_tool_type"] == "freeform"
@@ -295,7 +328,7 @@ async def test_backend_codex_models_uses_bootstrap_upstream_metadata(async_clien
         assert gpt56["reasoning_summary_format"] == "experimental"
         assert gpt56["comp_hash"] == "3000"
         assert gpt56["experimental_supported_tools"] == []
-        assert gpt56["max_context_window"] == 372_000
+        assert gpt56["max_context_window"] == 272_000
         assert gpt56["service_tiers"] == [
             {"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"}
         ]
@@ -590,6 +623,85 @@ async def test_backend_codex_models_defaults_source_model_context_window(async_c
     assert source_entry["prefer_websockets"] is False
 
 
+@pytest.mark.parametrize(
+    ("case", "raw_tools", "expected_tools"),
+    [
+        ("mixed", ["custom", 42, {"type": "bad"}], ["custom"]),
+        ("non-list", "custom", []),
+    ],
+)
+@pytest.mark.asyncio
+async def test_codex_catalog_sanitizes_invalid_source_tool_metadata(
+    async_client,
+    case: str,
+    raw_tools: JsonValue,
+    expected_tools: list[str],
+):
+    model = f"external-{case}-tool-metadata"
+    await _create_model_source(
+        async_client,
+        name=f"codex-source-{case}-tool-metadata",
+        model=model,
+        supports_responses=True,
+        raw_metadata_json=json.dumps({"experimental_supported_tools": raw_tools}),
+    )
+
+    response = await async_client.get("/backend-api/codex/models")
+
+    assert response.status_code == 200
+    entry = next(item for item in response.json()["models"] if item["slug"] == model)
+    assert entry["experimental_supported_tools"] == expected_tools
+
+    alias_response = await async_client.get(
+        "/v1/models",
+        params={"client_version": "0.144.3"},
+    )
+    assert alias_response.status_code == 200
+    alias_entry = next(item for item in alias_response.json()["models"] if item["slug"] == model)
+    assert alias_entry["experimental_supported_tools"] == expected_tools
+
+
+@pytest.mark.parametrize(
+    ("case", "raw_policy"),
+    [
+        ("null", None),
+        ("non-object", "tokens"),
+        ("missing-limit", {"mode": "tokens"}),
+        ("invalid-mode", {"mode": "characters", "limit": 1_234}),
+        ("string-limit", {"mode": "tokens", "limit": "4096"}),
+        ("limit-overflow", {"mode": "tokens", "limit": 2**63}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_codex_catalog_defaults_invalid_source_truncation_policy(
+    async_client,
+    case: str,
+    raw_policy: JsonValue,
+):
+    model = f"external-{case}-truncation-policy"
+    await _create_model_source(
+        async_client,
+        name=f"codex-source-{case}-truncation-policy",
+        model=model,
+        supports_responses=True,
+        raw_metadata_json=json.dumps({"truncation_policy": raw_policy}),
+    )
+
+    response = await async_client.get("/backend-api/codex/models")
+
+    assert response.status_code == 200
+    entry = next(item for item in response.json()["models"] if item["slug"] == model)
+    assert entry["truncation_policy"] == {"mode": "tokens", "limit": 10_000}
+
+    alias_response = await async_client.get(
+        "/v1/models",
+        params={"client_version": "0.144.3"},
+    )
+    assert alias_response.status_code == 200
+    alias_entry = next(item for item in alias_response.json()["models"] if item["slug"] == model)
+    assert alias_entry["truncation_policy"] == {"mode": "tokens", "limit": 10_000}
+
+
 @pytest.mark.asyncio
 async def test_backend_codex_models_never_exposes_source_request_overrides(async_client):
     await _create_model_source(
@@ -684,6 +796,37 @@ async def test_backend_codex_models_unions_service_tiers_across_accounts(async_c
     tier_slugs = {t.get("slug") for t in (model.get("service_tiers") or [])}
     assert "fast" in tier_slugs
     assert "fast" in (model.get("additional_speed_tiers") or [])
+
+
+@pytest.mark.asyncio
+async def test_backend_codex_models_filters_unknown_reasoning_efforts(async_client):
+    registry = get_model_registry()
+    model = replace(
+        _make_upstream_model(
+            "source-gpt",
+            raw={
+                "shell_type": "shell_command",
+                "visibility": "list",
+            },
+        ),
+        supported_reasoning_levels=tuple(
+            ReasoningLevel(effort=effort, description=effort)
+            for effort in ("none", "high", "provider-specific", "ultra")
+        ),
+        default_reasoning_level="provider-specific",
+    )
+    await registry.update({"plus": [model], "pro": [model]})
+
+    resp = await async_client.get("/backend-api/codex/models")
+
+    assert resp.status_code == 200
+    entry = next(m for m in resp.json()["models"] if m["slug"] == "source-gpt")
+    assert [level["effort"] for level in entry["supported_reasoning_levels"]] == [
+        "none",
+        "high",
+        "ultra",
+    ]
+    assert entry["default_reasoning_level"] is None
 
 
 @pytest.mark.asyncio
@@ -1422,6 +1565,61 @@ async def test_codex_catalog_hides_last_known_metadata_omitted_by_live_refresh(a
     v1_resp = await async_client.get("/v1/models")
     assert v1_resp.status_code == 200
     assert "gpt-5.6-sol" not in {item["id"] for item in v1_resp.json()["data"]}
+
+
+@pytest.mark.asyncio
+async def test_codex_catalog_completes_required_fields_for_hidden_bootstrap_metadata(async_client):
+    registry = get_model_registry()
+    live_sol = _make_upstream_model(
+        "gpt-5.6-sol",
+        raw={
+            "shell_type": "shell_command",
+            "visibility": "list",
+            "truncation_policy": {"mode": "tokens", "limit": 4_096, "future_setting": "preserved"},
+            "experimental_supported_tools": ["live-tool"],
+        },
+    )
+    await registry.update({"pro": [live_sol]})
+    registry_state = await registry.export_state()
+    legacy_metadata = dict(registry_state.metadata_models or {})
+    legacy_raw: dict[str, JsonValue] = {
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "availability_nux": None,
+    }
+    legacy_metadata["gpt-5.2"] = _make_upstream_model("gpt-5.2", raw=legacy_raw)
+    legacy_metadata["gpt-5.3-codex"] = _make_upstream_model("gpt-5.3-codex", raw=legacy_raw)
+    await registry.import_state(
+        ModelRegistryExport(snapshot=registry_state.snapshot, metadata_models=legacy_metadata),
+        content_hash="legacy-metadata-without-required-fields",
+    )
+
+    response = await async_client.get(
+        "/backend-api/codex/models",
+        params={"client_version": "0.144.3"},
+    )
+
+    assert response.status_code == 200
+    entries = {entry["slug"]: entry for entry in response.json()["models"]}
+    assert entries["gpt-5.2"]["visibility"] == "hide"
+    assert entries["gpt-5.2"]["truncation_policy"] == {"mode": "bytes", "limit": 10_000}
+    assert entries["gpt-5.2"]["experimental_supported_tools"] == []
+    assert entries["gpt-5.3-codex"]["visibility"] == "hide"
+    assert entries["gpt-5.3-codex"]["truncation_policy"] == {"mode": "tokens", "limit": 10_000}
+    assert entries["gpt-5.3-codex"]["experimental_supported_tools"] == []
+    assert entries["gpt-5.6-sol"]["truncation_policy"] == {
+        "mode": "tokens",
+        "limit": 4_096,
+        "future_setting": "preserved",
+    }
+    assert entries["gpt-5.6-sol"]["experimental_supported_tools"] == ["live-tool"]
+
+    alias_response = await async_client.get(
+        "/v1/models",
+        params={"client_version": "0.144.3"},
+    )
+    assert alias_response.status_code == 200
+    assert alias_response.json() == response.json()
 
 
 @pytest.mark.asyncio

@@ -27,9 +27,12 @@ class DashboardUsageCost(DashboardModel):
 class DashboardUsageMetrics(DashboardModel):
     requests: int | None = None
     tokens: int | None = None
+    conversations: int = 0
+    conversation_requests: int = 0
     cached_input_tokens: int | None = Field(default=None, alias="cachedInputTokens")
     error_rate: float | None = Field(default=None, alias="errorRate")
     error_count: int | None = Field(default=None, alias="errorCount")
+    cancelled_count: int | None = Field(default=None, alias="cancelledCount")
     top_error: str | None = None
 
 

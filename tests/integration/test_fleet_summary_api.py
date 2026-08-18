@@ -3,20 +3,24 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from app.core import shutdown as shutdown_state
 from app.core.config.settings_cache import get_settings_cache
 from app.core.crypto import TokenEncryptor
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus, RequestKind, RequestLog, StickySession, StickySessionKind
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
+from app.modules.accounts.service import AccountsService
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import ApiKeyCreateData, ApiKeyData, ApiKeysService
 from app.modules.fleet import api as fleet_api
-from app.modules.usage.repository import UsageRepository
+from app.modules.fleet.schemas import FleetRefreshResponse
+from app.modules.usage.repository import UsageRepository, UsageWindowWrite
+from app.modules.usage.updater import AccountRefreshResult
 
 pytestmark = pytest.mark.integration
 
@@ -72,6 +76,7 @@ def _make_account(
     *,
     status: AccountStatus = AccountStatus.ACTIVE,
     plan_type: str = "plus",
+    last_refresh: datetime | None = None,
 ) -> Account:
     encryptor = TokenEncryptor()
     return Account(
@@ -82,7 +87,7 @@ def _make_account(
         access_token_encrypted=encryptor.encrypt("access"),
         refresh_token_encrypted=encryptor.encrypt("refresh"),
         id_token_encrypted=encryptor.encrypt("id"),
-        last_refresh=utcnow(),
+        last_refresh=last_refresh or utcnow(),
         status=status,
         deactivation_reason=None,
     )
@@ -117,17 +122,20 @@ async def _seed_account_with_windows(
     primary_reset_at: int,
     secondary_reset_at: int,
     status: AccountStatus = AccountStatus.ACTIVE,
+    recorded_at: datetime | None = None,
+    last_refresh: datetime | None = None,
 ) -> None:
     async with SessionLocal() as session:
         accounts_repo = AccountsRepository(session)
         usage_repo = UsageRepository(session)
-        await accounts_repo.upsert(_make_account(account_id, email, status=status))
+        await accounts_repo.upsert(_make_account(account_id, email, status=status, last_refresh=last_refresh))
         await usage_repo.add_entry(
             account_id,
             primary_used_percent,
             window="primary",
             reset_at=primary_reset_at,
             window_minutes=_PRIMARY_WINDOW_MINUTES,
+            recorded_at=recorded_at,
         )
         await usage_repo.add_entry(
             account_id,
@@ -135,6 +143,7 @@ async def _seed_account_with_windows(
             window="secondary",
             reset_at=secondary_reset_at,
             window_minutes=_SECONDARY_WINDOW_MINUTES,
+            recorded_at=recorded_at,
         )
 
 
@@ -290,12 +299,91 @@ async def test_fleet_summary_returns_minimal_projection_with_valid_key(async_cli
     assert account["status"] == "active"
     assert account["planType"] == "plus"
     assert account["lastRefreshAt"] is not None
+    assert account["usageRefreshedAt"] is not None
     assert account["primary"]["remainingPercent"] == 62
     assert account["primary"]["windowMinutes"] == _PRIMARY_WINDOW_MINUTES
     assert account["primary"]["resetAt"] is not None
     assert account["secondary"]["remainingPercent"] == 80
     assert account["secondary"]["windowMinutes"] == _SECONDARY_WINDOW_MINUTES
     assert account["secondary"]["resetAt"] is not None
+
+
+@pytest.mark.asyncio
+async def test_fleet_summary_reports_null_usage_freshness_without_samples(async_client, db_setup):
+    plain_key = await _create_api_key("fleet-summary-no-samples-key")
+    async with SessionLocal() as session:
+        await AccountsRepository(session).upsert(_make_account("acc_no_samples", "no-samples@example.com"))
+
+    response = await async_client.get(
+        "/api/fleet/summary",
+        headers={"Authorization": f"Bearer {plain_key}"},
+    )
+
+    assert response.status_code == 200
+    account = response.json()["accounts"][0]
+    assert account["lastRefreshAt"] is not None
+    assert account["usageRefreshedAt"] is None
+
+
+@pytest.mark.asyncio
+async def test_force_probe_advances_usage_freshness_without_changing_oauth_refresh(
+    async_client,
+    db_setup,
+    monkeypatch,
+):
+    plain_key = await _create_api_key("fleet-summary-probe-freshness-key")
+    oauth_refreshed_at = utcnow()
+    initial_usage_at = datetime(2026, 1, 1, 9, 0, 0)
+    refreshed_usage_at = datetime(2026, 1, 1, 10, 0, 0)
+    await _seed_account_with_windows(
+        "acc_probe_freshness",
+        "probe-freshness@example.com",
+        primary_used_percent=10.0,
+        secondary_used_percent=20.0,
+        primary_reset_at=1_900_000_000,
+        secondary_reset_at=1_900_500_000,
+        recorded_at=initial_usage_at,
+        last_refresh=oauth_refreshed_at,
+    )
+
+    async def _fake_probe(self, *, access_token, chatgpt_account_id, model):
+        del self, access_token, chatgpt_account_id, model
+        return 200
+
+    async def _force_refresh_with_new_snapshot(self, account, *, ignore_refresh_disabled=False):
+        assert ignore_refresh_disabled is True
+        await self._usage_repo.add_account_snapshot(
+            account.id,
+            [
+                UsageWindowWrite(
+                    window="primary",
+                    used_percent=15.0,
+                    reset_at=1_900_000_000,
+                    window_minutes=_PRIMARY_WINDOW_MINUTES,
+                ),
+                UsageWindowWrite(
+                    window="secondary",
+                    used_percent=25.0,
+                    reset_at=1_900_500_000,
+                    window_minutes=_SECONDARY_WINDOW_MINUTES,
+                ),
+            ],
+            recorded_at=refreshed_usage_at,
+        )
+        return AccountRefreshResult(usage_written=True, fetch_succeeded=True)
+
+    monkeypatch.setattr(AccountsService, "_send_probe_request", _fake_probe)
+    monkeypatch.setattr("app.modules.usage.updater.UsageUpdater.force_refresh_result", _force_refresh_with_new_snapshot)
+
+    headers = {"Authorization": f"Bearer {plain_key}"}
+    before = (await async_client.get("/api/fleet/summary", headers=headers)).json()["accounts"][0]
+    probe = await async_client.post("/api/accounts/acc_probe_freshness/probe")
+    after = (await async_client.get("/api/fleet/summary", headers=headers)).json()["accounts"][0]
+
+    assert probe.status_code == 200, probe.text
+    assert before["usageRefreshedAt"] == "2026-01-01T09:00:00Z"
+    assert after["usageRefreshedAt"] == "2026-01-01T10:00:00Z"
+    assert before["lastRefreshAt"] == after["lastRefreshAt"]
 
 
 @pytest.mark.asyncio
@@ -331,6 +419,7 @@ async def test_fleet_summary_omits_sensitive_fields(async_client, db_setup):
         "primary",
         "secondary",
         "lastRefreshAt",
+        "usageRefreshedAt",
     }
 
 
@@ -390,6 +479,7 @@ async def test_fleet_summary_hides_usage_when_key_disables_account_pool_usage(as
     assert account["email"] == "usage-hidden@example.com"
     assert account["status"] == "active"
     assert account["lastRefreshAt"] is None
+    assert account["usageRefreshedAt"] is None
     assert account["primary"] == {"remainingPercent": None, "resetAt": None, "windowMinutes": None}
     assert account["secondary"] == {"remainingPercent": None, "resetAt": None, "windowMinutes": None}
 
@@ -417,6 +507,7 @@ async def test_fleet_summary_hides_usage_when_key_only_allows_upstream_limits(as
     assert account["email"] == "upstream-only@example.com"
     assert account["status"] == "active"
     assert account["lastRefreshAt"] is None
+    assert account["usageRefreshedAt"] is None
     assert account["primary"] == {"remainingPercent": None, "resetAt": None, "windowMinutes": None}
     assert account["secondary"] == {"remainingPercent": None, "resetAt": None, "windowMinutes": None}
 
@@ -442,6 +533,7 @@ async def test_fleet_summary_hides_usage_when_key_omits_upstream_limits(async_cl
     account = response.json()["accounts"][0]
     assert account["accountId"] == "acc_usage_hidden"
     assert account["lastRefreshAt"] is None
+    assert account["usageRefreshedAt"] is None
     assert account["primary"] == {"remainingPercent": None, "resetAt": None, "windowMinutes": None}
     assert account["secondary"] == {"remainingPercent": None, "resetAt": None, "windowMinutes": None}
 
@@ -473,6 +565,7 @@ async def test_fleet_summary_hides_usage_when_global_api_key_quota_privacy_enabl
     account = response.json()["accounts"][0]
     assert account["accountId"] == "acc_global_usage_hidden"
     assert account["lastRefreshAt"] is None
+    assert account["usageRefreshedAt"] is None
     assert account["primary"] == {"remainingPercent": None, "resetAt": None, "windowMinutes": None}
     assert account["secondary"] == {"remainingPercent": None, "resetAt": None, "windowMinutes": None}
 
@@ -605,6 +698,7 @@ async def test_fleet_observability_reports_pressure_and_sticky_without_sensitive
             "label": "observe@example.com",
             "requestCount": 3,
             "errorCount": 1,
+            "cancelledCount": 0,
             "inputTokens": 150,
             "cachedInputTokens": 70,
             "outputTokens": 35,
@@ -651,6 +745,58 @@ async def test_fleet_observability_reports_pressure_and_sticky_without_sensitive
     assert "sticky-observe" not in raw
     assert "203.0.113" not in raw
     assert "secret upstream error body" not in raw
+
+
+@pytest.mark.asyncio
+async def test_fleet_observability_excludes_cancelled_from_error_count(async_client, db_setup):
+    # Regression for #1552: cancelled (client-disconnect) terminals are not
+    # upstream errors — they leave errorCount/topErrorCode and surface as
+    # cancelledCount instead.
+    await get_settings_cache().invalidate()
+    plain_key = await _create_api_key("fleet-observability-cancelled-key")
+    await _seed_account_with_windows(
+        "acc_cancelled",
+        "cancelled@example.com",
+        primary_used_percent=10.0,
+        secondary_used_percent=20.0,
+        primary_reset_at=1735862400,
+        secondary_reset_at=1736467200,
+    )
+    now = utcnow()
+    await _seed_request_log(
+        "acc_cancelled",
+        "req-cancelled-success",
+        requested_at=now - timedelta(minutes=3),
+    )
+    for index in range(2):
+        await _seed_request_log(
+            "acc_cancelled",
+            f"req-cancelled-disconnect-{index}",
+            requested_at=now - timedelta(minutes=4 + index),
+            status="cancelled",
+            error_code="client_disconnected",
+        )
+    await _seed_request_log(
+        "acc_cancelled",
+        "req-cancelled-error",
+        requested_at=now - timedelta(minutes=6),
+        status="error",
+        error_code="upstream_500",
+    )
+
+    response = await async_client.get(
+        "/api/fleet/observability",
+        headers={"Authorization": f"Bearer {plain_key}"},
+    )
+
+    assert response.status_code == 200
+    thirty = _window(response.json(), "30m")
+    assert thirty["requestCount"] == 4
+    assert thirty["errorCount"] == 1
+    assert thirty["cancelledCount"] == 2
+    assert thirty["topErrorCode"] == "upstream_500"
+    assert thirty["byAccount"][0]["errorCount"] == 1
+    assert thirty["byAccount"][0]["cancelledCount"] == 2
 
 
 @pytest.mark.asyncio
@@ -899,6 +1045,9 @@ async def test_fleet_refresh_uses_route_local_usage_updater_and_invalidates_on_w
     monkeypatch,
 ):
     plain_key = await _create_api_key("fleet-refresh-updater-key")
+    oauth_refreshed_at = datetime(2026, 2, 1, 8, 0, 0)
+    initial_usage_at = datetime(2026, 2, 1, 9, 0, 0)
+    refreshed_usage_at = datetime(2026, 2, 1, 10, 0, 0)
     await _seed_account_with_windows(
         "acc_refresh_write",
         "refresh-write@example.com",
@@ -906,6 +1055,8 @@ async def test_fleet_refresh_uses_route_local_usage_updater_and_invalidates_on_w
         secondary_used_percent=10.0,
         primary_reset_at=1735862400,
         secondary_reset_at=1736467200,
+        recorded_at=initial_usage_at,
+        last_refresh=oauth_refreshed_at,
     )
 
     refresh_calls: list[list[str]] = []
@@ -924,6 +1075,24 @@ async def test_fleet_refresh_uses_route_local_usage_updater_and_invalidates_on_w
             updater_session_ids.append(id(self.usage_repo._session))
             refresh_calls.append([account.id for account in accounts])
             assert isinstance(latest_primary, dict)
+            await self.usage_repo.add_account_snapshot(
+                accounts[0].id,
+                [
+                    UsageWindowWrite(
+                        window="primary",
+                        used_percent=15.0,
+                        reset_at=1_900_000_000,
+                        window_minutes=_PRIMARY_WINDOW_MINUTES,
+                    ),
+                    UsageWindowWrite(
+                        window="secondary",
+                        used_percent=25.0,
+                        reset_at=1_900_500_000,
+                        window_minutes=_SECONDARY_WINDOW_MINUTES,
+                    ),
+                ],
+                recorded_at=refreshed_usage_at,
+            )
             return True
 
     class FakeRateLimitHeadersCache:
@@ -951,10 +1120,13 @@ async def test_fleet_refresh_uses_route_local_usage_updater_and_invalidates_on_w
         lambda: FakeAccountSelectionCache(),
     )
 
+    headers = {"Authorization": f"Bearer {plain_key}"}
+    before = (await async_client.get("/api/fleet/summary", headers=headers)).json()["accounts"][0]
     response = await async_client.post(
         "/api/fleet/refresh",
-        headers={"Authorization": f"Bearer {plain_key}"},
+        headers=headers,
     )
+    after = (await async_client.get("/api/fleet/summary", headers=headers)).json()["accounts"][0]
 
     assert response.status_code == 200
     payload = response.json()
@@ -964,6 +1136,9 @@ async def test_fleet_refresh_uses_route_local_usage_updater_and_invalidates_on_w
     assert refresh_calls == [["acc_refresh_write"]]
     assert updater_session_ids == background_session_ids
     assert invalidations == ["rate_limit_headers", "account_selection"]
+    assert before["usageRefreshedAt"] == "2026-02-01T09:00:00Z"
+    assert after["usageRefreshedAt"] == "2026-02-01T10:00:00Z"
+    assert before["lastRefreshAt"] == after["lastRefreshAt"] == "2026-02-01T08:00:00Z"
 
 
 @pytest.mark.asyncio
@@ -1014,6 +1189,35 @@ async def test_fleet_refresh_respects_account_scoped_api_key(async_client, db_se
     assert payload["accountCount"] == 1
     assert payload["attemptedCount"] == 1
     assert refresh_calls == [["acc_refresh_scope_visible"]]
+
+
+@pytest.mark.asyncio
+async def test_fleet_refresh_rejects_post_cutoff_work_with_dashboard_503(
+    async_client,
+    db_setup,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plain_key = await _create_api_key("fleet-refresh-post-cutoff-key")
+
+    def unexpected_refresh(_: list[str] | None) -> None:
+        raise AssertionError("post-cutoff fleet refresh coroutine was created")
+
+    monkeypatch.setattr(fleet_api, "_refresh_fleet_usage_with_owned_session", unexpected_refresh)
+    shutdown_state.close_control_plane_task_admission()
+
+    response = await async_client.post(
+        "/api/fleet/refresh",
+        headers={"Authorization": f"Bearer {plain_key}"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {
+            "code": "service_unavailable",
+            "message": "Server is draining",
+        }
+    }
+    assert fleet_api._BACKGROUND_REFRESH_TASKS == set()
 
 
 @pytest.mark.asyncio
@@ -1090,22 +1294,47 @@ async def test_fleet_refresh_owns_session_until_shielded_refresh_finishes(db_set
     )
     await asyncio.wait_for(refresh_started.wait(), timeout=1)
 
+    assert len(fleet_api._BACKGROUND_REFRESH_TASKS) == 1
+    owned_refresh_task = next(iter(fleet_api._BACKGROUND_REFRESH_TASKS))
+    assert not owned_refresh_task.done()
+
     request_task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await request_task
     await asyncio.sleep(0)
 
     assert not session_exited.is_set()
-    assert len(fleet_api._BACKGROUND_REFRESH_TASKS) == 1
+    assert fleet_api._BACKGROUND_REFRESH_TASKS == {owned_refresh_task}
+    drain = asyncio.create_task(fleet_api.drain_background_refresh_tasks(timeout_seconds=1))
+    await asyncio.sleep(0)
+    assert not drain.done()
+
     allow_refresh_finish.set()
+    assert await drain is True
     await asyncio.wait_for(session_exited.wait(), timeout=1)
-    await asyncio.wait_for(_wait_for_background_refresh_tasks_to_drain(), timeout=1)
 
     assert session_was_open_during_refresh == [True]
     assert invalidations == ["rate_limit_headers", "account_selection"]
     assert fleet_api._BACKGROUND_REFRESH_TASKS == set()
 
 
-async def _wait_for_background_refresh_tasks_to_drain() -> None:
-    while fleet_api._BACKGROUND_REFRESH_TASKS:
-        await asyncio.sleep(0)
+@pytest.mark.asyncio
+async def test_fleet_refresh_drain_reports_overdue_task(caplog: pytest.LogCaptureFixture) -> None:
+    fleet_api._BACKGROUND_REFRESH_TASKS.clear()
+    allow_refresh_finish = asyncio.Event()
+
+    async def blocked_refresh() -> FleetRefreshResponse:
+        await allow_refresh_finish.wait()
+        return FleetRefreshResponse(usage_written=False, account_count=0, attempted_count=0, generated_at=utcnow())
+
+    task = asyncio.create_task(blocked_refresh(), name="fleet-usage-refresh")
+    fleet_api._BACKGROUND_REFRESH_TASKS.add(task)
+    task.add_done_callback(fleet_api._handle_cancelled_refresh_task_done)
+
+    with caplog.at_level("WARNING", logger=fleet_api.__name__):
+        assert await fleet_api.drain_background_refresh_tasks(timeout_seconds=0) is False
+
+    assert "Fleet refresh task did not drain before shutdown: fleet-usage-refresh" in caplog.text
+    allow_refresh_finish.set()
+    assert await fleet_api.drain_background_refresh_tasks(timeout_seconds=1) is True
+    assert fleet_api._BACKGROUND_REFRESH_TASKS == set()

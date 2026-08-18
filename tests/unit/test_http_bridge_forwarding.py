@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from typing import cast
 
 import aiohttp
 import pytest
+from aiohttp.client_reqrep import ConnectionKey
 
 from app.core.config.settings import get_settings
 from app.core.openai.requests import ResponsesRequest
@@ -17,6 +19,7 @@ from app.modules.proxy.http_bridge_forwarding import (
     HTTP_BRIDGE_CLIENT_IP_HEADER,
     HTTP_BRIDGE_CLIENT_IP_SIGNATURE_HEADER,
     HTTP_BRIDGE_CODEX_AFFINITY_HEADER,
+    HTTP_BRIDGE_FILE_OWNER_HEADER,
     HTTP_BRIDGE_FORWARDED_HEADER,
     HTTP_BRIDGE_ORIGIN_INSTANCE_HEADER,
     HTTP_BRIDGE_ORIGINAL_UNANCHORED_HEADER,
@@ -48,6 +51,24 @@ def _temp_bridge_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterato
 
 def _payload() -> ResponsesRequest:
     return ResponsesRequest.model_validate({"model": "gpt-5.4", "instructions": "hi", "input": "hi"})
+
+
+def _payload_with_file() -> ResponsesRequest:
+    return ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.4",
+            "instructions": "hi",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "read"},
+                        {"type": "input_file", "file_id": "file-owner-bound"},
+                    ],
+                }
+            ],
+        }
+    )
 
 
 def _use_legacy_forward_signature(
@@ -101,6 +122,78 @@ def test_parse_forwarded_request_accepts_signed_internal_forward() -> None:
     assert forwarded.context == context
     assert forwarded.context.original_affinity_kind is None
     assert forwarded.context.original_affinity_key is None
+
+
+def test_parse_forwarded_request_preserves_signed_file_owner_proof() -> None:
+    payload = _payload()
+    context = HTTPBridgeForwardContext(
+        origin_instance="instance-a",
+        target_instance="instance-b",
+        codex_session_affinity=True,
+        downstream_turn_state="http_turn_file_owner",
+        file_owner_account_id="acc-file-owner",
+    )
+    headers = build_owner_forward_headers(headers={}, payload=payload, context=context)
+
+    forwarded, error = parse_forwarded_request(
+        headers,
+        payload=payload,
+        current_instance="instance-b",
+    )
+
+    assert error is None
+    assert forwarded is not None
+    assert forwarded.context.file_owner_account_id == "acc-file-owner"
+
+
+@pytest.mark.parametrize("downgrade", ["tamper", "strip_full_signature"])
+def test_parse_forwarded_request_rejects_unbound_file_owner_proof(downgrade: str) -> None:
+    payload = _payload()
+    context = HTTPBridgeForwardContext(
+        origin_instance="instance-a",
+        target_instance="instance-b",
+        codex_session_affinity=True,
+        downstream_turn_state=None,
+        file_owner_account_id="acc-file-owner",
+    )
+    headers = build_owner_forward_headers(headers={}, payload=payload, context=context)
+    if downgrade == "tamper":
+        headers[HTTP_BRIDGE_FILE_OWNER_HEADER] = "acc-attacker"
+    else:
+        headers.pop(HTTP_BRIDGE_SIGNATURE_V2_HEADER)
+
+    forwarded, error = parse_forwarded_request(
+        headers,
+        payload=payload,
+        current_instance="instance-b",
+    )
+
+    assert forwarded is None
+    assert error is not None
+    assert error.payload["error"]["code"] == "bridge_forward_invalid"
+
+
+def test_parse_forwarded_request_rejects_file_payload_without_full_context_signature() -> None:
+    payload = _payload_with_file()
+    context = HTTPBridgeForwardContext(
+        origin_instance="instance-a",
+        target_instance="instance-b",
+        codex_session_affinity=True,
+        downstream_turn_state=None,
+    )
+    headers = build_owner_forward_headers(headers={}, payload=payload, context=context)
+    headers.pop(HTTP_BRIDGE_FILE_OWNER_HEADER, None)
+    headers.pop(HTTP_BRIDGE_SIGNATURE_V2_HEADER)
+
+    forwarded, error = parse_forwarded_request(
+        headers,
+        payload=payload,
+        current_instance="instance-b",
+    )
+
+    assert forwarded is None
+    assert error is not None
+    assert error.payload["error"]["code"] == "bridge_forward_invalid"
 
 
 def test_parse_forwarded_request_accepts_signed_internal_forward_with_client_ip() -> None:
@@ -1025,7 +1118,7 @@ async def test_owner_forward_uses_direct_session_without_env_proxy(monkeypatch: 
     get_settings.cache_clear()
 
     client = HTTPBridgeOwnerClient()
-    ready_calls: list[bool] = []
+    response_state_calls: list[str] = []
     payload = _payload()
     context = HTTPBridgeForwardContext(
         origin_instance="instance-a",
@@ -1042,14 +1135,15 @@ async def test_owner_forward_uses_direct_session_without_env_proxy(monkeypatch: 
             headers={"Authorization": "Bearer proxy-key"},
             context=context,
             request_started_at=10.0,
-            on_response_ready=lambda: ready_calls.append(True),
+            on_response_wait=lambda: response_state_calls.append("wait"),
+            on_response_ready=lambda: response_state_calls.append("ready"),
         )
     ]
 
     assert len(events) == 1
     assert '"type":"response.failed"' in events[0]
     assert '"code":"stream_incomplete"' in events[0]
-    assert ready_calls == [True]
+    assert response_state_calls == ["wait", "ready"]
     assert captured["trust_env"] is False
     skip_auto_headers = captured["skip_auto_headers"]
     assert isinstance(skip_auto_headers, frozenset)
@@ -1148,6 +1242,231 @@ async def test_owner_forward_allows_json_content_type_for_internal_post(
     skip_auto_headers = captured["skip_auto_headers"]
     assert isinstance(skip_auto_headers, frozenset)
     assert aiohttp.hdrs.CONTENT_TYPE not in skip_auto_headers
+
+
+def _connector_error() -> aiohttp.ClientConnectorError:
+    connection_key = ConnectionKey(
+        host="instance-b",
+        port=2455,
+        is_ssl=False,
+        ssl=False,
+        proxy=None,
+        proxy_auth=None,
+        proxy_headers_hash=None,
+    )
+    return aiohttp.ClientConnectorError(connection_key, ConnectionRefusedError("connection refused"))
+
+
+@pytest.mark.asyncio
+async def test_owner_forward_connector_failure_does_not_mark_dispatched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResponse:
+        async def __aenter__(self) -> "FakeResponse":
+            raise _connector_error()
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class FakeSession:
+        def __init__(self, *, timeout: aiohttp.ClientTimeout, trust_env: bool) -> None:
+            del timeout, trust_env
+
+        async def __aenter__(self) -> "FakeSession":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, url: str, **kwargs: object) -> FakeResponse:
+            del url, kwargs
+            return FakeResponse()
+
+    monkeypatch.setattr("app.modules.proxy.http_bridge_forwarding.aiohttp.ClientSession", FakeSession)
+    monkeypatch.setattr("app.modules.proxy.http_bridge_forwarding.time.monotonic", lambda: 10.0)
+    dispatched = {"called": False}
+
+    async def collect() -> None:
+        client = HTTPBridgeOwnerClient()
+        async for _event in client.stream_responses(
+            owner_endpoint="http://instance-b:2455",
+            payload=_payload(),
+            headers={"Authorization": "Bearer proxy-key"},
+            context=HTTPBridgeForwardContext(
+                origin_instance="instance-a",
+                target_instance="instance-b",
+                codex_session_affinity=False,
+                downstream_turn_state=None,
+            ),
+            request_started_at=10.0,
+            on_request_dispatched=lambda: dispatched.__setitem__("called", True),
+        ):
+            return
+
+    with pytest.raises(aiohttp.ClientConnectorError):
+        await collect()
+    assert dispatched["called"] is False
+
+
+@pytest.mark.asyncio
+async def test_owner_forward_midflight_transport_failure_marks_dispatched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResponse:
+        async def __aenter__(self) -> "FakeResponse":
+            raise aiohttp.ClientError("connection reset after request")
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class FakeSession:
+        def __init__(self, *, timeout: aiohttp.ClientTimeout, trust_env: bool) -> None:
+            del timeout, trust_env
+
+        async def __aenter__(self) -> "FakeSession":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, url: str, **kwargs: object) -> FakeResponse:
+            del url, kwargs
+            return FakeResponse()
+
+    monkeypatch.setattr("app.modules.proxy.http_bridge_forwarding.aiohttp.ClientSession", FakeSession)
+    monkeypatch.setattr("app.modules.proxy.http_bridge_forwarding.time.monotonic", lambda: 10.0)
+    dispatched = {"called": False}
+
+    async def collect() -> None:
+        client = HTTPBridgeOwnerClient()
+        async for _event in client.stream_responses(
+            owner_endpoint="http://instance-b:2455",
+            payload=_payload(),
+            headers={"Authorization": "Bearer proxy-key"},
+            context=HTTPBridgeForwardContext(
+                origin_instance="instance-a",
+                target_instance="instance-b",
+                codex_session_affinity=False,
+                downstream_turn_state=None,
+            ),
+            request_started_at=10.0,
+            on_request_dispatched=lambda: dispatched.__setitem__("called", True),
+        ):
+            return
+
+    with pytest.raises(aiohttp.ClientError):
+        await collect()
+    assert dispatched["called"] is True
+
+
+@pytest.mark.asyncio
+async def test_owner_forward_non_200_body_read_failure_keeps_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResponse:
+        status = 502
+
+        async def __aenter__(self) -> "FakeResponse":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def text(self) -> str:
+            raise aiohttp.ClientPayloadError("truncated owner error body")
+
+    class FakeSession:
+        def __init__(self, *, timeout: aiohttp.ClientTimeout, trust_env: bool) -> None:
+            del timeout, trust_env
+
+        async def __aenter__(self) -> "FakeSession":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, url: str, **kwargs: object) -> FakeResponse:
+            del url, kwargs
+            return FakeResponse()
+
+    monkeypatch.setattr("app.modules.proxy.http_bridge_forwarding.aiohttp.ClientSession", FakeSession)
+    monkeypatch.setattr("app.modules.proxy.http_bridge_forwarding.time.monotonic", lambda: 10.0)
+    dispatched = {"called": False}
+    rejected = {"called": False}
+
+    async def collect() -> None:
+        client = HTTPBridgeOwnerClient()
+        async for _event in client.stream_responses(
+            owner_endpoint="http://instance-b:2455",
+            payload=_payload(),
+            headers={"Authorization": "Bearer proxy-key"},
+            context=HTTPBridgeForwardContext(
+                origin_instance="instance-a",
+                target_instance="instance-b",
+                codex_session_affinity=False,
+                downstream_turn_state=None,
+            ),
+            request_started_at=10.0,
+            on_request_dispatched=lambda: dispatched.__setitem__("called", True),
+            on_response_rejected=lambda: rejected.__setitem__("called", True),
+        ):
+            return
+
+    with pytest.raises(aiohttp.ClientPayloadError):
+        await collect()
+    assert rejected["called"] is True
+    assert dispatched["called"] is False
+
+
+@pytest.mark.asyncio
+async def test_owner_forward_cancel_during_aenter_marks_dispatched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResponse:
+        async def __aenter__(self) -> "FakeResponse":
+            raise asyncio.CancelledError()
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class FakeSession:
+        def __init__(self, *, timeout: aiohttp.ClientTimeout, trust_env: bool) -> None:
+            del timeout, trust_env
+
+        async def __aenter__(self) -> "FakeSession":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, url: str, **kwargs: object) -> FakeResponse:
+            del url, kwargs
+            return FakeResponse()
+
+    monkeypatch.setattr("app.modules.proxy.http_bridge_forwarding.aiohttp.ClientSession", FakeSession)
+    monkeypatch.setattr("app.modules.proxy.http_bridge_forwarding.time.monotonic", lambda: 10.0)
+    dispatched = {"called": False}
+
+    async def collect() -> None:
+        client = HTTPBridgeOwnerClient()
+        async for _event in client.stream_responses(
+            owner_endpoint="http://instance-b:2455",
+            payload=_payload(),
+            headers={"Authorization": "Bearer proxy-key"},
+            context=HTTPBridgeForwardContext(
+                origin_instance="instance-a",
+                target_instance="instance-b",
+                codex_session_affinity=False,
+                downstream_turn_state=None,
+            ),
+            request_started_at=10.0,
+            on_request_dispatched=lambda: dispatched.__setitem__("called", True),
+        ):
+            return
+
+    with pytest.raises(asyncio.CancelledError):
+        await collect()
+    assert dispatched["called"] is True
 
 
 def test_build_owner_forward_headers_strips_hop_by_hop_headers() -> None:

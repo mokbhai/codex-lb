@@ -84,7 +84,8 @@ def _service_inline_input_image_urls() -> Any:
 
 
 def _stream_keepalive_max_count() -> int:
-    return int(_service_global_or("_STREAM_KEEPALIVE_MAX_COUNT", _STREAM_KEEPALIVE_MAX_COUNT))
+    service_override = int(_service_global_or("_STREAM_KEEPALIVE_MAX_COUNT", _STREAM_KEEPALIVE_MAX_COUNT))
+    return max(1, service_override)
 
 
 def _prewarm_response_timeout_seconds() -> float:
@@ -306,7 +307,7 @@ def _websocket_safe_headers_with_turn_state(headers: Mapping[str, str], turn_sta
     filtered = {
         key: value
         for key, value in filter_inbound_websocket_headers(dict(headers)).items()
-        if key.lower() not in _response_create_compatibility_metadata_headers()
+        if key.lower() not in _response_create_compatibility_metadata_headers() and key.lower() != "x-codex-turn-state"
     }
     return cast(dict[str, str], _headers_with_turn_state(filtered, turn_state))
 
@@ -373,6 +374,10 @@ def _websocket_auth_request_can_switch_account(*args: Any, **kwargs: Any) -> Any
 
 def _classify_upstream_close(*args: Any, **kwargs: Any) -> Any:
     return _service_global("_classify_upstream_close")(*args, **kwargs)
+
+
+def _is_account_neutral_transport_drop(*args: Any, **kwargs: Any) -> Any:
+    return _service_global("_is_account_neutral_transport_drop")(*args, **kwargs)
 
 
 def _websocket_auth_failure_permanent_code(*args: Any, **kwargs: Any) -> Any:

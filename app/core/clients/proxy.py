@@ -15,6 +15,7 @@ import time
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
+from enum import Enum
 from typing import (
     Any,
     AsyncContextManager,
@@ -59,9 +60,9 @@ from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.model_registry import get_model_registry
 from app.core.openai.models import CompactResponsePayload, OpenAIError
 from app.core.openai.parsing import (
+    classify_event_type,
     parse_compact_response_payload,
     parse_error_payload,
-    parse_sse_event,
 )
 from app.core.openai.requests import (
     ResponsesCompactRequest,
@@ -74,16 +75,24 @@ from app.core.resilience.circuit_breaker import (
     _is_server_error,
     get_circuit_breaker_for_account,
 )
+from app.core.resilience.network_recovery import (
+    PROCESS_NETWORK_UNAVAILABLE_CODE,
+    is_pre_dispatch_connection_failure,
+    is_process_network_failure,
+    is_proxy_endpoint_failure,
+    process_network_error_code,
+)
 from app.core.types import JsonObject, JsonValue
 from app.core.upstream_proxy import ResolvedUpstreamRoute
 from app.core.usage.live_hub import publish_live_usage
 from app.core.usage.live_snapshots import EVENT_MARKER, parse_rate_limit_event_text, parse_rate_limit_headers
 from app.core.utils.json_guards import is_json_mapping
 from app.core.utils.request_id import get_request_id
-from app.core.utils.sse import format_sse_event, parse_sse_data_json
+from app.core.utils.sse import format_sse_event, parse_sse_data_json, sse_event_type_from_block
 
 CODEX_INSTALLATION_ID_HEADER = "x-codex-installation-id"
 CODEX_TURN_METADATA_HEADER = "x-codex-turn-metadata"
+CODEX_LB_REQUIRED_CAPABILITY_HEADER = "x-codex-lb-required-capability"
 CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
 CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY = "ws_request_header_x_openai_internal_codex_responses_lite"
 
@@ -95,6 +104,7 @@ IGNORE_INBOUND_HEADERS = {
     "forwarded",
     "x-real-ip",
     CODEX_INSTALLATION_ID_HEADER,
+    CODEX_LB_REQUIRED_CAPABILITY_HEADER,
     "true-client-ip",
 }
 INTERNAL_OPENAI_UPSTREAM_HEADERS = frozenset(
@@ -115,6 +125,11 @@ _SSE_EVENT_TYPE_ALIASES = {
     "response.audio.delta": "response.output_audio.delta",
     "response.audio_transcript.delta": "response.output_audio_transcript.delta",
 }
+# Bare (unquoted) alias names gate the block-level alias normalizer: they
+# match both the JSON `"type":"<alias>"` in a data line and a stale
+# `event: <alias>` framing line. False positives (an alias name inside delta
+# text) just take the full-parse path.
+_SSE_EVENT_TYPE_ALIAS_MARKERS = tuple(_SSE_EVENT_TYPE_ALIASES)
 _SSE_LINE_BOUNDARY_RE = re.compile(r"\r\n|\r|\n")
 _RESPONSE_STREAM_TERMINAL_EVENT_TYPES = frozenset(
     {
@@ -149,6 +164,9 @@ _RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE = (
     "[codex-lb omitted historical tool output ({bytes} bytes) to fit upstream websocket budget]"
 )
 _RESPONSE_CREATE_IMAGE_OMISSION_NOTICE = "[codex-lb omitted historical inline image to fit upstream websocket budget]"
+_SLIMMABLE_TOOL_CALL_OUTPUT_ITEM_TYPES = frozenset(
+    {"function_call_output", "custom_tool_call_output", "apply_patch_call_output"}
+)
 _UPSTREAM_TRACE_HEADER_ALLOWLIST = frozenset(
     {
         "accept",
@@ -335,11 +353,29 @@ async def _service_circuit_breaker_context(
             ):
                 await cb._record_success()
             else:
-                await cb._record_failure(e)
+                await _record_account_circuit_breaker_failure(cb, e)
         raise
     finally:
         if is_probe and cb is not None:
             await cb.release_half_open_probe()
+
+
+def _is_process_network_transport_error(exc: BaseException) -> bool:
+    # A permanent lookup failure for the configured proxy hostname identifies
+    # that endpoint, not a host-wide outage; transient proxy DNS remains neutral.
+    return is_process_network_failure(
+        exc,
+        include_permanent_dns=not is_proxy_endpoint_failure(exc),
+    ) or (isinstance(exc, CodexTransportError) and exc.error_code == PROCESS_NETWORK_UNAVAILABLE_CODE)
+
+
+async def _record_account_circuit_breaker_failure(circuit_breaker: CircuitBreaker, exc: Exception) -> bool:
+    """Record endpoint/account failures while keeping host-network loss neutral."""
+
+    if _is_process_network_transport_error(exc):
+        return False
+    await circuit_breaker._record_failure(exc)
+    return True
 
 
 _HELD_HALF_OPEN_PROBE_FLAG = "_codex_lb_half_open_probe_held"
@@ -445,6 +481,9 @@ class ProxyResponseError(Exception):
         failure_exception_type: str | None = None,
         upstream_status_code: int | None = None,
         upstream_error_code: str | None = None,
+        failed_session: aiohttp.ClientSession | None = None,
+        retry_after_seconds: int | None = None,
+        reservation_released: bool = False,
     ) -> None:
         super().__init__(f"Proxy response error ({status_code})")
         self.status_code = status_code
@@ -455,6 +494,58 @@ class ProxyResponseError(Exception):
         self.failure_exception_type = failure_exception_type
         self.upstream_status_code = upstream_status_code
         self.upstream_error_code = upstream_error_code
+        self.failed_session = failed_session
+        self.retry_after_seconds = retry_after_seconds
+        self.reservation_released = reservation_released
+
+
+def is_confirmed_pre_dispatch_transport_error(exc: ProxyResponseError) -> bool:
+    """Return whether the transport proved the upstream request never dispatched.
+
+    Only this provenance authorizes replaying a movable request on another
+    account: a typed connector failure while reaching the account's routed
+    proxy endpoint, before any request bytes could leave for upstream.
+    Host-wide network loss (``proxy_network_unavailable``) stays on its
+    account-neutral process recovery path instead of penalizing the selected
+    account, and ambiguous dispatch outcomes remain non-replayable.
+    """
+
+    if not (exc.retryable_same_contract and exc.failure_phase == "connect"):
+        return False
+    error = exc.payload.get("error")
+    error_code = error.get("code") if isinstance(error, dict) else None
+    return error_code != PROCESS_NETWORK_UNAVAILABLE_CODE
+
+
+def _process_network_failure_error(
+    message: str,
+    exc: Exception,
+    *,
+    retryable_same_contract: bool,
+    failed_session: aiohttp.ClientSession | None,
+) -> ProxyResponseError:
+    """Preserve replay provenance and failed shared generation independently."""
+
+    # Dispatch may make the request unsafe to replay, but it does not make the
+    # concrete failed generation safe for subsequent requests to keep using.
+    return ProxyResponseError(
+        502,
+        openai_error(PROCESS_NETWORK_UNAVAILABLE_CODE, message),
+        failure_phase="connect" if retryable_same_contract else "upstream",
+        retryable_same_contract=retryable_same_contract,
+        failure_detail="process_network_connect_error" if retryable_same_contract else "transport_error",
+        failure_exception_type=type(exc).__name__,
+        failed_session=failed_session,
+    )
+
+
+def _failed_shared_session_for_process_network_error(
+    error_code: str,
+    session: aiohttp.ClientSession,
+) -> aiohttp.ClientSession | None:
+    # Replay safety answers whether this request may run again; it must not
+    # decide whether later callers inherit a concrete failed generation.
+    return session if error_code == PROCESS_NETWORK_UNAVAILABLE_CODE else None
 
 
 @dataclass(frozen=True)
@@ -462,6 +553,15 @@ class CodexControlResponse:
     status_code: int
     body: bytes
     headers: Mapping[str, str]
+
+
+class CodexControlRequestPrivacyPolicy(Enum):
+    STANDARD = "standard"
+    PRIVATE_REALTIME = "private_realtime"
+
+    @property
+    def redacts_sensitive_details(self) -> bool:
+        return self is CodexControlRequestPrivacyPolicy.PRIVATE_REALTIME
 
 
 def _should_drop_inbound_header(name: str) -> bool:
@@ -564,9 +664,13 @@ _SDK_FINGERPRINT_HEADER_KEYS: frozenset[str] = frozenset(
 _SDK_FINGERPRINT_HEADER_PREFIXES: tuple[str, ...] = ("x-stainless-",)
 _CODEX_CLI_ORIGINATOR = "codex_cli_rs"
 _CHATGPT_ACCOUNT_ID_HEADER = "ChatGPT-Account-Id"
-_DEFAULT_FINGERPRINT_OS = "Mac OS 26.5.0"
-_DEFAULT_FINGERPRINT_ARCH = "arm64"
-_DEFAULT_FINGERPRINT_TERMINAL = "iTerm.app/3.6.10"
+# Fixed Codex client fingerprint (issue #1340 / PRINCIPLES.md P2). These
+# values impersonate a plausible first-party Codex CLI install and are
+# maintained in lockstep with ``model_registry_client_version`` bumps; they
+# are not deployment tunables.
+_FINGERPRINT_OS = "Mac OS 26.5.0"
+_FINGERPRINT_ARCH = "arm64"
+_FINGERPRINT_TERMINAL = "iTerm.app/3.6.10"
 
 
 def build_codex_user_agent(version: str) -> str:
@@ -574,16 +678,10 @@ def build_codex_user_agent(version: str) -> str:
     ``openai/codex`` (``codex-rs/login/src/auth/default_client.rs``):
     ``codex_cli_rs/<version> (<os>; <arch>) <terminal>``.
 
-    OS/arch/terminal come from operator-configurable settings; the version is
-    the live Codex client version resolved by the caller. Settings access is
-    defensive (``getattr`` with built-in defaults) so header construction can
-    never raise and fail an otherwise-valid upstream request.
+    OS/arch/terminal are fixed fingerprint constants; the version is the live
+    Codex client version resolved by the caller.
     """
-    settings = get_settings()
-    os_name = getattr(settings, "codex_fingerprint_os", _DEFAULT_FINGERPRINT_OS)
-    arch = getattr(settings, "codex_fingerprint_arch", _DEFAULT_FINGERPRINT_ARCH)
-    terminal = getattr(settings, "codex_fingerprint_terminal", _DEFAULT_FINGERPRINT_TERMINAL)
-    return f"{_CODEX_CLI_ORIGINATOR}/{version} ({os_name}; {arch}) {terminal}"
+    return f"{_CODEX_CLI_ORIGINATOR}/{version} ({_FINGERPRINT_OS}; {_FINGERPRINT_ARCH}) {_FINGERPRINT_TERMINAL}"
 
 
 def _is_native_codex_user_agent(user_agent: str | None) -> bool:
@@ -867,9 +965,10 @@ def _maybe_log_upstream_request_start(
     method: str,
     payload_summary: str,
     payload_json: str | None = None,
+    privacy_policy: CodexControlRequestPrivacyPolicy = CodexControlRequestPrivacyPolicy.STANDARD,
 ) -> None:
-    settings = get_settings()
-    if not settings.log_upstream_request_summary and not settings.log_upstream_request_payload:
+    trace_channels = get_settings().trace_channels
+    if "upstream_summary" not in trace_channels and "upstream_payload" not in trace_channels:
         return
 
     request_id = get_request_id()
@@ -877,7 +976,11 @@ def _maybe_log_upstream_request_start(
     account_id = _account_id_for_upstream_log(headers)
     header_keys = _interesting_upstream_header_keys(headers)
 
-    if settings.log_upstream_request_summary:
+    if privacy_policy.redacts_sensitive_details:
+        account_id = "<redacted>"
+        payload_summary = "sensitive private payload redacted"
+        payload_json = None
+    if "upstream_summary" in trace_channels:
         logger.info(
             "upstream_request_start request_id=%s kind=%s method=%s target=%s account_id=%s headers=%s payload=%s",
             request_id,
@@ -888,7 +991,7 @@ def _maybe_log_upstream_request_start(
             header_keys,
             payload_summary,
         )
-    if settings.log_upstream_request_payload and payload_json is not None:
+    if "upstream_payload" in trace_channels and payload_json is not None:
         logger.info(
             "upstream_request_payload request_id=%s kind=%s target=%s payload=%s",
             request_id,
@@ -913,9 +1016,9 @@ def _maybe_log_upstream_request_complete(
     failure_detail: str | None = None,
     failure_exception_type: str | None = None,
     retryable_same_contract: bool | None = None,
+    privacy_policy: CodexControlRequestPrivacyPolicy = CodexControlRequestPrivacyPolicy.STANDARD,
 ) -> None:
-    settings = get_settings()
-    if not settings.log_upstream_request_summary:
+    if "upstream_summary" not in get_settings().trace_channels:
         return
 
     level = logging.INFO
@@ -923,6 +1026,13 @@ def _maybe_log_upstream_request_complete(
         level = logging.ERROR
     elif (status_code is not None and status_code >= 400) or error_code is not None:
         level = logging.WARNING
+    account_id = "<redacted>" if privacy_policy.redacts_sensitive_details else _account_id_for_upstream_log(headers)
+    if privacy_policy.redacts_sensitive_details:
+        error_code = "upstream_error" if error_code is not None else None
+        error_message = "Upstream request failed" if error_message is not None else None
+        payload_object = None
+        failure_detail = None
+        failure_exception_type = None
 
     logger.log(
         level,
@@ -936,7 +1046,7 @@ def _maybe_log_upstream_request_complete(
         kind,
         method,
         _summarize_upstream_target(url),
-        _account_id_for_upstream_log(headers),
+        account_id,
         status_code,
         int((time.monotonic() - started_at) * 1000),
         error_code,
@@ -1247,11 +1357,73 @@ def _normalize_sse_data_line(line: str) -> str:
     return line
 
 
+def _normalize_sse_event_type_line(line: str) -> str:
+    if not line.startswith("event:"):
+        return line
+    value = line[6:]
+    if value.startswith(" "):
+        value = value[1:]
+    normalized_type = _SSE_EVENT_TYPE_ALIASES.get(value)
+    if normalized_type is None:
+        return line
+    return f"event: {normalized_type}"
+
+
+def _normalize_multi_data_sse_block(
+    event_block: str,
+    lines: list[str],
+    line_separator: str,
+    terminator: str,
+) -> str:
+    # Fragments of a payload split across multiple `data:` lines are not
+    # individually decodable, so alias detection must run on the combined
+    # payload (the SSE spec joins data-line values with "\n"). Decode it
+    # before touching the `event:` framing line so both surfaces are
+    # rewritten together; if the combined payload cannot be decoded, leave
+    # the whole block — framing line included — untouched rather than
+    # emitting a partially rewritten frame.
+    payload = parse_sse_data_json(event_block)
+    if payload is None:
+        return event_block
+
+    data_replacement: str | None = None
+    event_type = payload.get("type")
+    if isinstance(event_type, str) and event_type in _SSE_EVENT_TYPE_ALIASES:
+        payload["type"] = _SSE_EVENT_TYPE_ALIASES[event_type]
+        data_replacement = f"data: {json.dumps(payload, ensure_ascii=True, separators=(',', ':'))}"
+
+    normalized_lines: list[str] = []
+    changed = False
+    data_line_emitted = False
+    for line in lines:
+        if line.startswith("data:"):
+            if data_replacement is None:
+                normalized_lines.append(line)
+            elif not data_line_emitted:
+                # The rewritten payload re-serializes compactly, so the
+                # fragments collapse into one canonical `data:` line.
+                normalized_lines.append(data_replacement)
+                data_line_emitted = True
+                changed = True
+            continue
+        normalized_line = _normalize_sse_event_type_line(line)
+        if normalized_line != line:
+            changed = True
+        normalized_lines.append(normalized_line)
+    if not changed:
+        return event_block
+
+    normalized = line_separator.join(normalized_lines)
+    if terminator:
+        return normalized + terminator
+    return normalized
+
+
 def _normalize_sse_event_block(event_block: str) -> str:
     if not event_block:
         return event_block
 
-    if '"type":' not in event_block:
+    if not any(marker in event_block for marker in _SSE_EVENT_TYPE_ALIAS_MARKERS):
         return event_block
 
     if event_block.endswith("\r\n\r\n"):
@@ -1275,10 +1447,17 @@ def _normalize_sse_event_block(event_block: str) -> str:
     if not lines:
         return event_block
 
+    if sum(1 for line in lines if line.startswith("data:")) > 1:
+        return _normalize_multi_data_sse_block(event_block, lines, line_separator, terminator)
+
     normalized_lines: list[str] = []
     changed = False
     for line in lines:
-        normalized_line = _normalize_sse_data_line(line)
+        # Rewrite both surfaces of a legacy alias: the JSON payload's `type`
+        # and the SSE `event:` framing line. Rewriting only the data line
+        # would emit mismatched framing when the block is relayed verbatim
+        # downstream instead of being re-serialized.
+        normalized_line = _normalize_sse_event_type_line(_normalize_sse_data_line(line))
         if normalized_line != line:
             changed = True
         normalized_lines.append(normalized_line)
@@ -1297,37 +1476,42 @@ def _normalize_stream_event_payload(payload: dict[str, JsonValue]) -> dict[str, 
         normalized = dict(payload)
         normalized["type"] = _SSE_EVENT_TYPE_ALIASES[event_type]
         return normalized
-    error = parse_error_payload(payload)
-    if error is not None:
-        detail = error.model_dump(exclude_none=True)
-        event = response_failed_event(
-            _normalize_error_code(detail.get("code"), detail.get("type")),
-            detail.get("message", "Upstream websocket error"),
-            error_type=detail.get("type") or "server_error",
-            response_id=get_request_id(),
-            error_param=detail.get("param"),
-        )
-        _copy_quota_error_metadata(event["response"]["error"], detail)
-        return cast(dict[str, JsonValue], event)
-    if event_type == "error":
-        message = _extract_upstream_message(payload) or "Upstream websocket error"
-        code = payload.get("code")
-        error_type = payload.get("error_type") or payload.get("type")
-        normalized_code = _normalize_error_code(
-            code if isinstance(code, str) else None,
-            error_type if isinstance(error_type, str) else None,
-        )
-        if not isinstance(code, str) and normalized_code == "error":
-            normalized_code = "upstream_error"
-        return cast(
-            dict[str, JsonValue],
-            response_failed_event(
-                normalized_code,
-                message,
-                error_type=error_type if isinstance(error_type, str) and error_type != "error" else "server_error",
+    # Error-envelope schema validation is the only pydantic work on this hot
+    # path: classify from the parsed dict first and validate only error-shaped
+    # frames (``type == "error"`` or a top-level ``error`` envelope) so delta
+    # frames never reach the pydantic adapter.
+    if classify_event_type(payload) == "error" or isinstance(payload.get("error"), dict):
+        error = parse_error_payload(payload)
+        if error is not None:
+            detail = error.model_dump(exclude_none=True)
+            event = response_failed_event(
+                _normalize_error_code(detail.get("code"), detail.get("type")),
+                detail.get("message", "Upstream websocket error"),
+                error_type=detail.get("type") or "server_error",
                 response_id=get_request_id(),
-            ),
-        )
+                error_param=detail.get("param"),
+            )
+            _copy_quota_error_metadata(event["response"]["error"], detail)
+            return cast(dict[str, JsonValue], event)
+        if event_type == "error":
+            message = _extract_upstream_message(payload) or "Upstream websocket error"
+            code = payload.get("code")
+            error_type = payload.get("error_type") or payload.get("type")
+            normalized_code = _normalize_error_code(
+                code if isinstance(code, str) else None,
+                error_type if isinstance(error_type, str) else None,
+            )
+            if not isinstance(code, str) and normalized_code == "error":
+                normalized_code = "upstream_error"
+            return cast(
+                dict[str, JsonValue],
+                response_failed_event(
+                    normalized_code,
+                    message,
+                    error_type=error_type if isinstance(error_type, str) and error_type != "error" else "server_error",
+                    response_id=get_request_id(),
+                ),
+            )
     return payload
 
 
@@ -1336,6 +1520,21 @@ def _normalize_stream_payload_for_http_block(
     *,
     enforce_openai_sdk_contract: bool = True,
 ) -> tuple[str, str | None]:
+    # Cheap path for the dominant delta traffic: a canonically framed block
+    # exposes its event type on the `event:` line, so no JSON parse is needed.
+    # Full parsing remains for `error` frames and any block carrying an
+    # `"error"` substring (the SDK-contract rewrite in
+    # `_normalize_stream_event_payload` keys off a top-level error envelope),
+    # legacy alias types (rewritten payloads), and non-canonical or data-only
+    # framing (the event type then comes from the payload itself).
+    cheap_event_type = sse_event_type_from_block(event_block)
+    if (
+        cheap_event_type is not None
+        and cheap_event_type != "error"
+        and cheap_event_type not in _SSE_EVENT_TYPE_ALIASES
+        and '"error"' not in event_block
+    ):
+        return event_block, cheap_event_type
     if not enforce_openai_sdk_contract:
         payload = parse_sse_data_json(event_block)
         if payload is None:
@@ -1423,6 +1622,21 @@ def _client_metadata_uses_responses_lite(client_metadata: Mapping[str, JsonValue
 def _payload_has_responses_lite_websocket_marker(payload: Mapping[str, JsonValue]) -> bool:
     raw_metadata = payload.get("client_metadata")
     return is_json_mapping(raw_metadata) and _client_metadata_uses_responses_lite(raw_metadata)
+
+
+def _finalize_responses_lite_reasoning_context(
+    payload: dict[str, JsonValue],
+    *,
+    responses_lite: bool,
+) -> None:
+    if not responses_lite:
+        return
+    raw_reasoning = payload.get("reasoning")
+    if raw_reasoning is not None and not is_json_mapping(raw_reasoning):
+        return
+    reasoning = dict(raw_reasoning) if is_json_mapping(raw_reasoning) else {}
+    reasoning["context"] = "all_turns"
+    payload["reasoning"] = reasoning
 
 
 def _normalize_responses_lite_websocket_client_metadata(
@@ -1552,6 +1766,7 @@ async def _open_upstream_websocket(
     is_probe = False
     if circuit_breaker is not None:
         is_probe = await circuit_breaker.pre_call_check()
+    probe_transferred = False
 
     request_obj = getattr(session, "request", None)
     if not callable(request_obj):
@@ -1567,13 +1782,16 @@ async def _open_upstream_websocket(
             websocket = await asyncio.wait_for(websocket_cm.__aenter__(), timeout=connect_timeout_seconds)
             if hold_half_open_probe and is_probe and circuit_breaker is not None:
                 _bind_half_open_probe(websocket, circuit_breaker)
+                probe_transferred = True
             return websocket_cm, websocket
         except Exception as exc:
             if circuit_breaker is not None:
-                await circuit_breaker._record_failure(exc)
+                await _record_account_circuit_breaker_failure(circuit_breaker, exc)
             raise
         finally:
-            if is_probe and circuit_breaker is not None and not hold_half_open_probe:
+            # Only a successfully opened websocket can own a held probe. A
+            # failed connect must release it so recovery can make another try.
+            if is_probe and circuit_breaker is not None and not probe_transferred:
                 await circuit_breaker.release_half_open_probe()
     request = cast(Callable[..., Awaitable[aiohttp.ClientResponse]], request_obj)
 
@@ -1596,7 +1814,7 @@ async def _open_upstream_websocket(
             )
         except Exception as exc:
             if circuit_breaker is not None:
-                await circuit_breaker._record_failure(exc)
+                await _record_account_circuit_breaker_failure(circuit_breaker, exc)
             raise
 
         async def _raise_handshake_error(message: str) -> None:
@@ -1646,12 +1864,12 @@ async def _open_upstream_websocket(
             transport = conn.transport
             assert transport is not None
             reader = WebSocketDataQueue(conn_proto, 2**16, loop=session._loop)
-            conn_proto.set_parser(WebSocketReader(reader, max_msg_size), reader)
+            parser = WebSocketReader(reader, max_msg_size, compress=False, decode_text=True)
+            conn_proto.set_parser(parser, reader)
             writer = WebSocketWriter(conn_proto, transport, use_mask=True, compress=0, notakeover=False)
         except BaseException as exc:
             if circuit_breaker is not None and not _cb_recorded and isinstance(exc, Exception):
-                await circuit_breaker._record_failure(exc)
-                _cb_recorded = True
+                _cb_recorded = await _record_account_circuit_breaker_failure(circuit_breaker, exc)
             resp.close()
             raise
 
@@ -1670,9 +1888,10 @@ async def _open_upstream_websocket(
         )
         if hold_half_open_probe and is_probe and circuit_breaker is not None:
             _bind_half_open_probe(websocket, circuit_breaker)
+            probe_transferred = True
         return websocket, websocket
     finally:
-        if is_probe and circuit_breaker is not None and not hold_half_open_probe:
+        if is_probe and circuit_breaker is not None and not probe_transferred:
             await circuit_breaker.release_half_open_probe()
 
 
@@ -1683,7 +1902,12 @@ async def _stream_websocket_events(
     total_timeout_seconds: float | None,
     max_event_bytes: int,
     enforce_openai_sdk_contract: bool = True,
-) -> AsyncIterator[str]:
+) -> AsyncIterator[tuple[str, str | None]]:
+    """Yield ``(sse_block, event_type)`` pairs.
+
+    The event type is extracted from the payload parsed once here so that
+    downstream consumers never re-decode the formatted block.
+    """
     deadline = None if total_timeout_seconds is None else time.monotonic() + total_timeout_seconds
 
     while True:
@@ -1726,9 +1950,10 @@ async def _stream_websocket_events(
         if not isinstance(payload, dict):
             continue
         normalized = payload if not enforce_openai_sdk_contract else _normalize_stream_event_payload(payload)
-        event_type = normalized.get("type")
-        yield format_sse_event(normalized)
-        if isinstance(event_type, str) and _is_response_stream_terminal_event_type(
+        raw_event_type = normalized.get("type")
+        event_type = raw_event_type if isinstance(raw_event_type, str) else None
+        yield format_sse_event(normalized), event_type
+        if event_type is not None and _is_response_stream_terminal_event_type(
             event_type,
             enforce_openai_sdk_contract=enforce_openai_sdk_contract,
         ):
@@ -1742,7 +1967,8 @@ async def _stream_codex_websocket_events(
     total_timeout_seconds: float | None,
     max_event_bytes: int,
     enforce_openai_sdk_contract: bool = True,
-) -> AsyncIterator[str]:
+) -> AsyncIterator[tuple[str, str | None]]:
+    """Yield ``(sse_block, event_type)`` pairs; see ``_stream_websocket_events``."""
     deadline = None if total_timeout_seconds is None else time.monotonic() + total_timeout_seconds
 
     while True:
@@ -1767,7 +1993,14 @@ async def _stream_codex_websocket_events(
             if exc is None and isinstance(msg.data, BaseException):
                 exc = msg.data
             exc = exc or aiohttp.ClientError("Upstream websocket error")
-            raise CodexTransportError(codex_transport_error_message("websocket stream", None, exc)) from exc
+            raise CodexTransportError(
+                codex_transport_error_message("websocket stream", None, exc),
+                error_code=process_network_error_code(
+                    exc,
+                    fallback="upstream_unavailable",
+                    include_permanent_dns=False,
+                ),
+            ) from exc
         if msg.type == aiohttp.WSMsgType.TEXT:
             text = msg.data if isinstance(msg.data, str) else str(msg.data)
         elif msg.type == aiohttp.WSMsgType.BINARY:
@@ -1785,9 +2018,10 @@ async def _stream_codex_websocket_events(
         if not isinstance(payload, dict):
             continue
         normalized = payload if not enforce_openai_sdk_contract else _normalize_stream_event_payload(payload)
-        event_type = normalized.get("type")
-        yield format_sse_event(normalized)
-        if isinstance(event_type, str) and _is_response_stream_terminal_event_type(
+        raw_event_type = normalized.get("type")
+        event_type = raw_event_type if isinstance(raw_event_type, str) else None
+        yield format_sse_event(normalized), event_type
+        if event_type is not None and _is_response_stream_terminal_event_type(
             event_type,
             enforce_openai_sdk_contract=enforce_openai_sdk_contract,
         ):
@@ -1822,7 +2056,8 @@ async def _stream_responses_via_websocket(
     route_trace: UpstreamProxyRouteTrace | None = None,
     allow_direct_egress: bool = True,
     enforce_openai_sdk_contract: bool = True,
-) -> AsyncIterator[str]:
+) -> AsyncIterator[tuple[str, str | None]]:
+    """Yield ``(sse_block, event_type)`` pairs from the upstream websocket."""
     websocket_url = _to_websocket_upstream_url(url)
     request_started_at = time.monotonic()
     request_payload = _prepare_websocket_response_create_payload(payload_dict)
@@ -1846,7 +2081,7 @@ async def _stream_responses_via_websocket(
         nonlocal lifecycle_recorded
         if circuit_breaker is None or lifecycle_recorded:
             return
-        await circuit_breaker._record_failure(exc)
+        await _record_account_circuit_breaker_failure(circuit_breaker, exc)
         lifecycle_recorded = True
 
     connect_timeout_seconds = min(
@@ -1895,17 +2130,49 @@ async def _stream_responses_via_websocket(
             await _record_lifecycle_failure(exc)
             if owns_codex_client:
                 await active_codex_client.close()
+            error_code = (
+                exc.error_code
+                if isinstance(exc, CodexTransportError) and exc.error_code is not None
+                else process_network_error_code(
+                    exc,
+                    fallback="upstream_unavailable",
+                    include_permanent_dns=False,
+                )
+            )
+            if error_code == PROCESS_NETWORK_UNAVAILABLE_CODE and not (
+                isinstance(exc, CodexTransportError) and exc.retryable_same_contract
+            ):
+                raise CodexTransportError(
+                    codex_transport_error_message("websocket connect", route.endpoint_id, exc),
+                    status_code=exc.status_code if isinstance(exc, CodexTransportError) else None,
+                    error_code=error_code,
+                    retryable_same_contract=True,
+                ) from exc
             raise
     else:
-        websocket_cm, websocket = await _open_upstream_websocket(
-            session=client_session,
-            url=websocket_url,
-            headers=headers,
-            connect_timeout_seconds=connect_timeout_seconds,
-            max_msg_size=max_event_bytes,
-            account_id=account_id,
-            hold_half_open_probe=True,
-        )
+        try:
+            websocket_cm, websocket = await _open_upstream_websocket(
+                session=client_session,
+                url=websocket_url,
+                headers=headers,
+                connect_timeout_seconds=connect_timeout_seconds,
+                max_msg_size=max_event_bytes,
+                account_id=account_id,
+                hold_half_open_probe=True,
+            )
+        except Exception as exc:
+            error_code = process_network_error_code(
+                exc,
+                fallback="upstream_unavailable",
+                include_permanent_dns=not is_proxy_endpoint_failure(exc),
+            )
+            if error_code == PROCESS_NETWORK_UNAVAILABLE_CODE:
+                raise CodexTransportError(
+                    codex_transport_error_message("websocket connect", None, exc),
+                    error_code=error_code,
+                    retryable_same_contract=True,
+                ) from exc
+            raise
 
     try:
         send_json = getattr(websocket, "send_json", None)
@@ -1969,7 +2236,7 @@ async def _stream_responses_via_websocket(
                 enforce_openai_sdk_contract=enforce_openai_sdk_contract,
             )
         )
-        async for event in event_iter:
+        async for event, event_type in event_iter:
             archive_text(
                 direction="server_to_codex",
                 kind="responses",
@@ -1981,14 +2248,13 @@ async def _stream_responses_via_websocket(
                 headers=headers,
                 extra={"event_format": "sse"},
             )
-            parsed_event = parse_sse_event(event)
-            if parsed_event and _is_response_stream_terminal_event_type(
-                parsed_event.type,
+            if event_type is not None and _is_response_stream_terminal_event_type(
+                event_type,
                 enforce_openai_sdk_contract=enforce_openai_sdk_contract,
             ):
                 seen_terminal = True
                 await _record_lifecycle_success()
-            yield event
+            yield event, event_type
         if not seen_terminal:
             await _record_lifecycle_failure(aiohttp.ClientError("Upstream websocket closed without terminal event"))
     except Exception as exc:
@@ -2133,14 +2399,20 @@ def _slim_historical_response_input_item(item: JsonValue) -> tuple[JsonValue, in
     tool_outputs_slimmed = 0
     images_slimmed = 0
 
-    if item_mapping.get("type") == "function_call_output":
+    item_type = item_mapping.get("type")
+    if isinstance(item_type, str) and item_type in _SLIMMABLE_TOOL_CALL_OUTPUT_ITEM_TYPES:
         output = item_mapping.get("output")
-        output_text = output if isinstance(output, str) else None
-        if output_text is not None and _should_slim_historical_tool_output(output_text):
-            item_mapping["output"] = _RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE.format(
-                bytes=len(output_text.encode("utf-8"))
-            )
-            tool_outputs_slimmed += 1
+        if isinstance(output, str):
+            if _should_slim_historical_tool_output(output):
+                item_mapping["output"] = _RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE.format(
+                    bytes=len(output.encode("utf-8"))
+                )
+                tool_outputs_slimmed += 1
+        else:
+            slimmed_output, output_images_slimmed = _slim_historical_response_content(output)
+            if output_images_slimmed > 0:
+                item_mapping["output"] = slimmed_output
+                images_slimmed += output_images_slimmed
 
     content = item_mapping.get("content")
     slimmed_content, content_images_slimmed = _slim_historical_response_content(content)
@@ -2148,7 +2420,7 @@ def _slim_historical_response_input_item(item: JsonValue) -> tuple[JsonValue, in
         item_mapping["content"] = slimmed_content
         images_slimmed += content_images_slimmed
 
-    if item_mapping.get("type") == "input_image" and _is_inline_image_reference(item_mapping.get("image_url")):
+    if item_type == "input_image" and _is_inline_image_reference(item_mapping.get("image_url")):
         return _response_create_inline_image_notice_item(), tool_outputs_slimmed, images_slimmed + 1
 
     return item_mapping, tool_outputs_slimmed, images_slimmed
@@ -2520,7 +2792,7 @@ async def stream_responses(
                 publish_live_usage(
                     parse_rate_limit_event_text(event_block),
                     account_id=codex_lb_account_id,
-                    chatgpt_account_id=None if codex_lb_account_id else account_id,
+                    chatgpt_account_id=account_id,
                 )
             yield event_block
 
@@ -2590,8 +2862,16 @@ async def _stream_responses_with_session(
         )
     http_payload_dict = dict(payload_dict)
     _strip_responses_lite_websocket_client_metadata(http_payload_dict)
+    _finalize_responses_lite_reasoning_context(
+        http_payload_dict,
+        responses_lite=_payload_uses_responses_lite(http_payload_dict),
+    )
     websocket_payload_dict = dict(payload_dict)
     _set_responses_lite_websocket_client_metadata(websocket_payload_dict)
+    _finalize_responses_lite_reasoning_context(
+        websocket_payload_dict,
+        responses_lite=_payload_has_responses_lite_websocket_marker(websocket_payload_dict),
+    )
     payload_json = json.dumps(websocket_payload_dict, ensure_ascii=True, separators=(",", ":"))
     payload_size_estimate_bytes = len(payload_json.encode("utf-8"))
     transport_mode = _configured_stream_transport(
@@ -2622,14 +2902,32 @@ async def _stream_responses_with_session(
         pre_request_started_at,
         time.monotonic(),
     )
+    # sock_read carries the idle budget into the phase before response headers
+    # exist. Without it, a connection that is established but never answered is
+    # bounded only by the request budget, which is hours long, while it holds a
+    # per-session response-create gate that later turns queue behind.
     timeout = aiohttp.ClientTimeout(
         total=remaining_request_timeout,
         sock_connect=effective_connect_timeout,
-        sock_read=None,
+        sock_read=effective_idle_timeout,
     )
     started_at = time.monotonic()
 
     async def _stream_via_http(
+        current_headers: Mapping[str, str],
+        current_timeout: aiohttp.ClientTimeout,
+    ) -> AsyncIterator[str]:
+        try:
+            async for event_block in _stream_via_http_attempt(current_headers, current_timeout):
+                yield event_block
+        except aiohttp.SocketTimeoutError as exc:
+            # A socket read timeout means the connection was established and
+            # then produced nothing. That is an idle stream, not a transport
+            # failure, so it joins the idle-timeout path instead of being
+            # reported as an unavailable upstream.
+            raise StreamIdleTimeoutError() from exc
+
+    async def _stream_via_http_attempt(
         current_headers: Mapping[str, str],
         current_timeout: aiohttp.ClientTimeout,
     ) -> AsyncIterator[str]:
@@ -2665,7 +2963,7 @@ async def _stream_responses_with_session(
                     publish_live_usage(
                         parse_rate_limit_headers(getattr(raw_resp, "headers", None)),
                         account_id=codex_lb_account_id,
-                        chatgpt_account_id=None if codex_lb_account_id else account_id,
+                        chatgpt_account_id=account_id,
                     )
                 if resp.status >= 400:
                     if raise_for_status:
@@ -2712,13 +3010,7 @@ async def _stream_responses_with_session(
                         event_block,
                         enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                     )
-                    event = parse_sse_event(event_block)
-                    if event:
-                        if event.type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES or (
-                            event.type == "error" and not enforce_openai_sdk_contract
-                        ):
-                            seen_terminal = True
-                    elif isinstance(normalized_event_type, str) and (
+                    if isinstance(normalized_event_type, str) and (
                         normalized_event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES
                         or (normalized_event_type == "error" and not enforce_openai_sdk_contract)
                     ):
@@ -2759,7 +3051,7 @@ async def _stream_responses_with_session(
                 publish_live_usage(
                     parse_rate_limit_headers(getattr(resp, "headers", None)),
                     account_id=codex_lb_account_id,
-                    chatgpt_account_id=None if codex_lb_account_id else account_id,
+                    chatgpt_account_id=account_id,
                 )
             if resp.status >= 400:
                 if raise_for_status:
@@ -2806,13 +3098,7 @@ async def _stream_responses_with_session(
                     event_block,
                     enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                 )
-                event = parse_sse_event(event_block)
-                if event:
-                    if event.type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES or (
-                        event.type == "error" and not enforce_openai_sdk_contract
-                    ):
-                        seen_terminal = True
-                elif isinstance(normalized_event_type, str) and (
+                if isinstance(normalized_event_type, str) and (
                     normalized_event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES
                     or (normalized_event_type == "error" and not enforce_openai_sdk_contract)
                 ):
@@ -2839,7 +3125,7 @@ async def _stream_responses_with_session(
         headers=upstream_headers,
         method=method,
         payload_summary=_summarize_json_payload(payload_dict),
-        payload_json=payload_json if settings.log_upstream_request_payload else None,
+        payload_json=payload_json if "upstream_payload" in settings.trace_channels else None,
     )
     if transport == "http":
         archive_json(
@@ -2893,7 +3179,7 @@ async def _stream_responses_with_session(
         timeout = aiohttp.ClientTimeout(
             total=remaining_request_timeout,
             sock_connect=effective_connect_timeout,
-            sock_read=None,
+            sock_read=effective_idle_timeout,
         )
         started_at = time.monotonic()
         _maybe_log_upstream_request_start(
@@ -2902,7 +3188,7 @@ async def _stream_responses_with_session(
             headers=upstream_headers,
             method=method,
             payload_summary=_summarize_json_payload(payload_dict),
-            payload_json=payload_json if settings.log_upstream_request_payload else None,
+            payload_json=payload_json if "upstream_payload" in settings.trace_channels else None,
         )
         archive_json(
             direction="codex_to_server",
@@ -2920,7 +3206,7 @@ async def _stream_responses_with_session(
     try:
         if transport == "websocket":
             try:
-                async for event_block in _stream_responses_via_websocket(
+                async for event_block, event_type in _stream_responses_via_websocket(
                     payload_dict=payload_dict,
                     url=url,
                     headers=upstream_headers,
@@ -2938,14 +3224,11 @@ async def _stream_responses_with_session(
                 ):
                     if status_code is None:
                         status_code = 101
-                    event = parse_sse_event(event_block)
-                    if event:
-                        event_type = event.type
-                        if _is_response_stream_terminal_event_type(
-                            event_type,
-                            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
-                        ):
-                            seen_terminal = True
+                    if event_type is not None and _is_response_stream_terminal_event_type(
+                        event_type,
+                        enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+                    ):
+                        seen_terminal = True
                     yield event_block
             except aiohttp.WSServerHandshakeError as exc:
                 if not _should_fallback_to_http_after_websocket_handshake_error(transport_mode, exc):
@@ -3022,7 +3305,8 @@ async def _stream_responses_with_session(
         )
         return
     except CodexTransportError as exc:
-        error_code = "upstream_unavailable"
+        routed_error_code = exc.error_code or "upstream_unavailable"
+        error_code = routed_error_code
         error_message = _codex_route_transport_error_message(
             route=route,
             route_trace=route_trace,
@@ -3030,16 +3314,40 @@ async def _stream_responses_with_session(
             exc=exc,
         )
         response_error_message = cast(str, error_message)
-        failure_phase = "upstream"
+        failure_phase = exc.failure_phase or "upstream"
         failure_detail = "transport_error"
         failure_exception_type = type(exc).__name__
-        retryable_same_contract = True
+        retryable_same_contract = exc.retryable_same_contract and not exc.is_tls_verification_failure
+        if routed_error_code == PROCESS_NETWORK_UNAVAILABLE_CODE and retryable_same_contract:
+            # Routed Codex sessions are private to this attempt, so recovery
+            # legitimately has no shared HTTP generation for compare-and-swap.
+            raise _process_network_failure_error(
+                response_error_message,
+                exc,
+                retryable_same_contract=True,
+                failed_session=None,
+            ) from exc
+        if raise_for_status and retryable_same_contract:
+            raise ProxyResponseError(
+                exc.status_code or 502,
+                openai_error(routed_error_code, response_error_message),
+                failure_phase="connect",
+                retryable_same_contract=True,
+                failure_detail=failure_detail,
+                failure_exception_type=failure_exception_type,
+                upstream_status_code=exc.status_code,
+                upstream_error_code=routed_error_code,
+            ) from exc
         yield format_sse_event(
-            response_failed_event("upstream_unavailable", response_error_message, response_id=get_request_id()),
+            response_failed_event(routed_error_code, response_error_message, response_id=get_request_id()),
         )
         return
     except aiohttp.ClientError as exc:
-        error_code = "upstream_unavailable"
+        error_code = process_network_error_code(
+            exc,
+            fallback="upstream_unavailable",
+            include_permanent_dns=not is_proxy_endpoint_failure(exc),
+        )
         error_message = _codex_route_transport_error_message(
             route=route,
             route_trace=route_trace,
@@ -3047,12 +3355,39 @@ async def _stream_responses_with_session(
             exc=exc,
         )
         response_error_message = cast(str, error_message)
-        failure_phase = "upstream"
+        pre_dispatch_connection_failure = is_pre_dispatch_connection_failure(exc)
+        # Typed connector failures prove that neither the HTTP request nor the
+        # websocket response.create frame was dispatched. TLS verification is
+        # also pre-dispatch, but it is a stable configuration failure rather
+        # than a transient condition worth retrying on another account.
+        retryable_same_contract = pre_dispatch_connection_failure and not isinstance(exc, aiohttp.ClientSSLError)
+        failure_phase = "connect" if pre_dispatch_connection_failure else "upstream"
         failure_detail = "transport_error"
         failure_exception_type = type(exc).__name__
-        retryable_same_contract = True
+        # Direct HTTP streams and direct upstream WebSockets both use this
+        # leased session. Transport decides replay safety above, not whether
+        # the concrete failed shared generation must be retired.
+        if error_code == PROCESS_NETWORK_UNAVAILABLE_CODE:
+            raise _process_network_failure_error(
+                response_error_message,
+                exc,
+                retryable_same_contract=retryable_same_contract,
+                failed_session=client_session,
+            ) from exc
+        if raise_for_status and retryable_same_contract:
+            raise ProxyResponseError(
+                502,
+                openai_error(error_code or "upstream_unavailable", response_error_message),
+                failure_phase="connect",
+                retryable_same_contract=True,
+                failure_detail=failure_detail,
+                failure_exception_type=failure_exception_type,
+                failed_session=client_session,
+            ) from exc
         yield format_sse_event(
-            response_failed_event("upstream_unavailable", response_error_message, response_id=get_request_id()),
+            response_failed_event(
+                error_code or "upstream_unavailable", response_error_message, response_id=get_request_id()
+            ),
         )
         return
     except asyncio.CancelledError:
@@ -3074,7 +3409,7 @@ async def _stream_responses_with_session(
             failure_phase = "upstream"
             failure_detail = "transport_error"
             failure_exception_type = type(exc).__name__
-            retryable_same_contract = True
+            retryable_same_contract = is_pre_dispatch_connection_failure(exc)
             yield format_sse_event(
                 response_failed_event("upstream_unavailable", response_error_message, response_id=get_request_id()),
             )
@@ -3117,7 +3452,7 @@ async def _stream_responses_with_session(
             failure_phase = "upstream"
             failure_detail = "transport_error"
             failure_exception_type = type(exc).__name__
-            retryable_same_contract = True
+            retryable_same_contract = False
             yield format_sse_event(
                 response_failed_event(
                     "upstream_unavailable",
@@ -3149,7 +3484,11 @@ async def _stream_responses_with_session(
         retryable_same_contract = False
         raise
     except OSError as exc:
-        error_code = "upstream_unavailable"
+        error_code = process_network_error_code(
+            exc,
+            fallback="upstream_unavailable",
+            include_permanent_dns=not is_proxy_endpoint_failure(exc),
+        )
         error_message = _codex_route_transport_error_message(
             route=route,
             route_trace=route_trace,
@@ -3157,12 +3496,21 @@ async def _stream_responses_with_session(
             exc=exc,
         )
         response_error_message = cast(str, error_message)
-        failure_phase = "upstream"
+        retryable_same_contract = transport == "http" and is_pre_dispatch_connection_failure(exc)
+        failure_phase = "connect" if retryable_same_contract else "upstream"
         failure_detail = "transport_error"
         failure_exception_type = type(exc).__name__
-        retryable_same_contract = True
+        if error_code == PROCESS_NETWORK_UNAVAILABLE_CODE:
+            raise _process_network_failure_error(
+                response_error_message,
+                exc,
+                retryable_same_contract=retryable_same_contract,
+                failed_session=client_session,
+            ) from exc
         yield format_sse_event(
-            response_failed_event("upstream_unavailable", response_error_message, response_id=get_request_id()),
+            response_failed_event(
+                error_code or "upstream_unavailable", response_error_message, response_id=get_request_id()
+            ),
         )
         return
     except Exception as exc:
@@ -3324,10 +3672,6 @@ async def compact_responses(
         return await transport.execute()
 
 
-def _is_retryable_compact_status(status_code: int) -> bool:
-    return status_code in {500, 502, 503, 504}
-
-
 @dataclass(slots=True)
 class _CompactCommandTransport:
     payload: ResponsesCompactRequest
@@ -3362,13 +3706,17 @@ class _CompactCommandTransport:
         pre_request_started_at = time.monotonic()
         compact_timeout_seconds = _effective_compact_total_timeout(settings.upstream_compact_timeout_seconds)
         effective_connect_timeout = _effective_compact_connect_timeout(settings.upstream_connect_timeout_seconds)
-        payload_dict = self.payload.to_payload()
+        payload_dict = dict(self.payload.to_payload())
         if settings.image_inline_fetch_enabled:
             payload_dict = await _inline_input_image_urls(
                 payload_dict,
                 _as_image_fetch_session(self.session),
                 effective_connect_timeout,
             )
+        _finalize_responses_lite_reasoning_context(
+            payload_dict,
+            responses_lite=_payload_uses_responses_lite(payload_dict),
+        )
         _apply_responses_lite_http_header(upstream_headers, payload_dict)
         try:
             validate_compact_input_wire_budget(payload_dict)
@@ -3417,7 +3765,7 @@ class _CompactCommandTransport:
             method="POST",
             payload_summary=_summarize_json_payload(payload_dict),
             payload_json=json.dumps(payload_dict, ensure_ascii=True, separators=(",", ":"))
-            if settings.log_upstream_request_payload
+            if "upstream_payload" in settings.trace_channels
             else None,
         )
         archive_json(
@@ -3468,7 +3816,7 @@ class _CompactCommandTransport:
                     error_code, error_message = _error_details_from_envelope(error_payload)
                     failure_phase = "status"
                     failure_detail = error_message
-                    retryable_same_contract = _is_retryable_compact_status(status_code)
+                    retryable_same_contract = False
                     raise ProxyResponseError(
                         status_code,
                         error_payload,
@@ -3546,7 +3894,7 @@ class _CompactCommandTransport:
                     error_code, error_message = _error_details_from_envelope(error_payload)
                     failure_phase = "status"
                     failure_detail = error_message
-                    retryable_same_contract = _is_retryable_compact_status(resp.status)
+                    retryable_same_contract = False
                     raise ProxyResponseError(
                         resp.status,
                         error_payload,
@@ -3557,22 +3905,27 @@ class _CompactCommandTransport:
                     )
                 try:
                     data = await resp.json(content_type=None)
-                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                     message = str(exc) or "Request to upstream timed out"
-                    error_code = "upstream_unavailable"
+                    error_code = process_network_error_code(
+                        exc,
+                        fallback="upstream_unavailable",
+                        include_permanent_dns=not is_proxy_endpoint_failure(exc),
+                    )
                     error_message = message
                     failure_phase = "body_read"
                     failure_detail = message
                     failure_exception_type = type(exc).__name__
-                    retryable_same_contract = True
+                    retryable_same_contract = False
                     raise ProxyResponseError(
                         502,
-                        openai_error("upstream_unavailable", message),
+                        openai_error(error_code, message),
                         failure_phase=failure_phase,
                         retryable_same_contract=retryable_same_contract,
                         failure_detail=failure_detail,
                         failure_exception_type=failure_exception_type,
                         upstream_status_code=resp.status,
+                        failed_session=_failed_shared_session_for_process_network_error(error_code, self.session),
                     ) from exc
                 except Exception as exc:
                     error_code = "upstream_error"
@@ -3638,21 +3991,68 @@ class _CompactCommandTransport:
                 failure_detail=failure_detail,
                 failure_exception_type=failure_exception_type,
             ) from exc
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            message = str(exc) or "Request to upstream timed out"
-            error_code = "upstream_unavailable"
-            error_message = message
-            failure_phase = "connect"
-            failure_detail = message
+        except CodexTransportError as exc:
+            error_code = exc.error_code or "upstream_unavailable"
+            error_message = _codex_route_transport_error_message(
+                route=self.route,
+                route_trace=self.route_trace,
+                operation="compact",
+                exc=exc,
+            )
+            failure_phase = exc.failure_phase or ("connect" if exc.retryable_same_contract else "upstream")
+            failure_detail = "transport_error"
             failure_exception_type = type(exc).__name__
-            retryable_same_contract = True
+            retryable_same_contract = exc.retryable_same_contract
             raise ProxyResponseError(
                 502,
-                openai_error("upstream_unavailable", message),
+                openai_error(error_code, error_message),
                 failure_phase=failure_phase,
                 retryable_same_contract=retryable_same_contract,
                 failure_detail=failure_detail,
                 failure_exception_type=failure_exception_type,
+                failed_session=None,
+            ) from exc
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            message = str(exc) or "Request to upstream timed out"
+            error_code = process_network_error_code(
+                exc,
+                fallback="upstream_unavailable",
+                include_permanent_dns=not is_proxy_endpoint_failure(exc),
+            )
+            error_message = message
+            retryable_same_contract = is_pre_dispatch_connection_failure(exc)
+            failure_phase = "connect" if retryable_same_contract else "request"
+            failure_detail = message
+            failure_exception_type = type(exc).__name__
+            raise ProxyResponseError(
+                502,
+                openai_error(error_code, message),
+                failure_phase=failure_phase,
+                retryable_same_contract=retryable_same_contract,
+                failure_detail=failure_detail,
+                failure_exception_type=failure_exception_type,
+                failed_session=_failed_shared_session_for_process_network_error(error_code, self.session),
+            ) from exc
+        except OSError as exc:
+            message = str(exc) or "Request to upstream failed"
+            error_code = process_network_error_code(
+                exc,
+                fallback="upstream_unavailable",
+                include_permanent_dns=not is_proxy_endpoint_failure(exc),
+            )
+            error_message = message
+            failure_phase = "request"
+            failure_detail = message
+            failure_exception_type = type(exc).__name__
+            retryable_same_contract = False
+            raise ProxyResponseError(
+                502,
+                openai_error(error_code, message),
+                failure_phase=failure_phase,
+                retryable_same_contract=False,
+                failure_detail=failure_detail,
+                failure_exception_type=failure_exception_type,
+                failed_session=_failed_shared_session_for_process_network_error(error_code, self.session),
             ) from exc
         except Exception as exc:
             if self.route is None:
@@ -3660,15 +4060,15 @@ class _CompactCommandTransport:
             message = str(exc) or "Request to upstream failed before response"
             error_code = "upstream_unavailable"
             error_message = message
-            failure_phase = "connect"
+            failure_phase = "request"
             failure_detail = message
             failure_exception_type = type(exc).__name__
-            retryable_same_contract = True
+            retryable_same_contract = False
             raise ProxyResponseError(
                 502,
                 openai_error("upstream_unavailable", message),
                 failure_phase=failure_phase,
-                retryable_same_contract=retryable_same_contract,
+                retryable_same_contract=False,
                 failure_detail=failure_detail,
                 failure_exception_type=failure_exception_type,
             ) from exc
@@ -3832,7 +4232,7 @@ async def thread_goal_request(
         method=request_method,
         payload_summary=_summarize_json_payload(payload_dict),
         payload_json=json.dumps(payload_dict, ensure_ascii=True, separators=(",", ":"))
-        if settings.log_upstream_request_payload
+        if "upstream_payload" in settings.trace_channels
         else None,
     )
     try:
@@ -3992,11 +4392,15 @@ async def codex_control_request(
     route: ResolvedUpstreamRoute | None = None,
     codex_client: CodexClient | None = None,
     route_trace: UpstreamProxyRouteTrace | None = None,
+    privacy_policy: CodexControlRequestPrivacyPolicy = CodexControlRequestPrivacyPolicy.STANDARD,
     allow_direct_egress: bool = True,
 ) -> CodexControlResponse:
     settings = get_settings()
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
     normalized_path = path.strip("/")
+    effective_privacy_policy = (
+        CodexControlRequestPrivacyPolicy.PRIVATE_REALTIME if normalized_path == "realtime/calls" else privacy_policy
+    )
     upstream_path = normalized_path if normalized_path.startswith("wham/") else f"codex/{normalized_path}"
     url = f"{upstream_base}/{upstream_path}"
     request_method = method.upper()
@@ -4041,7 +4445,8 @@ async def codex_control_request(
     error_code: str | None = None
     error_message: str | None = None
     payload_summary: dict[str, JsonValue] | None = None
-    if payload and content_type and "json" in content_type.lower():
+    sensitive_realtime_payload = effective_privacy_policy.redacts_sensitive_details
+    if not sensitive_realtime_payload and payload and content_type and "json" in content_type.lower():
         with contextlib.suppress(Exception):
             decoded = json.loads(payload)
             if isinstance(decoded, dict):
@@ -4051,10 +4456,17 @@ async def codex_control_request(
         url=url,
         headers=upstream_headers,
         method=request_method,
-        payload_summary=_summarize_json_payload(payload_summary or {}),
-        payload_json=payload.decode("utf-8", errors="replace")
-        if payload is not None and settings.log_upstream_request_payload
-        else None,
+        payload_summary=(
+            "sensitive realtime payload redacted"
+            if sensitive_realtime_payload
+            else _summarize_json_payload(payload_summary or {})
+        ),
+        payload_json=(
+            payload.decode("utf-8", errors="replace")
+            if not sensitive_realtime_payload and payload is not None and "upstream_payload" in settings.trace_channels
+            else None
+        ),
+        privacy_policy=effective_privacy_policy,
     )
     try:
         if route is not None:
@@ -4171,6 +4583,7 @@ async def codex_control_request(
                 status_code=status_code,
                 error_code=error_code,
                 error_message=error_message,
+                privacy_policy=effective_privacy_policy,
             )
         finally:
             if lease is not None:
@@ -4288,7 +4701,7 @@ async def _transcribe_audio_with_session(
         method="POST",
         payload_summary=json.dumps(metadata, ensure_ascii=True, separators=(",", ":")),
         payload_json=json.dumps(metadata, ensure_ascii=True, separators=(",", ":"))
-        if settings.log_upstream_request_payload
+        if "upstream_payload" in settings.trace_channels
         else None,
     )
     try:

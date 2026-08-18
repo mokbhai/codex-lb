@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import date, datetime, timedelta, timezone
+from typing import TypedDict
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -18,6 +19,12 @@ from app.modules.reports.repository import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+class ReportAggregateFilters(TypedDict, total=False):
+    account_ids: list[str]
+    model: str
+    useragent_group: str
 
 
 @pytest.fixture
@@ -87,6 +94,21 @@ async def test_aggregate_daily_rows_groups_in_sql_and_returns_only_buckets_with_
                 latency_ms=2600,
                 latency_first_token_ms=600,
             ),
+            # Cancelled (client-disconnect) terminal on the same local day:
+            # counted in requests, excluded from error_count (#1552).
+            RequestLog(
+                account_id=None,
+                request_id="report-daily-3",
+                requested_at=datetime(2026, 6, 3, 17, 30, tzinfo=timezone.utc).replace(tzinfo=None),
+                model="gpt-5.1",
+                status="cancelled",
+                error_code="client_disconnected",
+                input_tokens=3,
+                output_tokens=0,
+                cached_input_tokens=0,
+                cost_usd=0.0,
+                latency_ms=100,
+            ),
         ]
     )
     await async_session.commit()
@@ -109,17 +131,355 @@ async def test_aggregate_daily_rows_groups_in_sql_and_returns_only_buckets_with_
     assert rows[0].median_tps == 4
     assert rows[0].median_queue_ms == 350
 
-    assert rows[1].requests == 1
-    assert rows[1].input_tokens == 5
+    assert rows[0].cancelled_count == 0
+
+    assert rows[1].requests == 2
+    assert rows[1].input_tokens == 8
     assert rows[1].output_tokens == 1
     assert rows[1].cached_input_tokens == 0
     assert rows[1].cost_usd == 0.1
     assert rows[1].active_accounts == 0
     assert rows[1].error_count == 1
+    assert rows[1].cancelled_count == 1
     assert rows[1].median_ttft_ms == 600
     assert rows[1].median_tps == 0.5
     # No queue samples on this day: zero-filled rather than null.
     assert rows[1].median_queue_ms == 0.0
+
+
+@pytest.mark.asyncio
+async def test_aggregate_summary_excludes_cancelled_from_errors_and_counts_them(
+    async_session: AsyncSession,
+) -> None:
+    """Regression for #1552: cancelled terminals stay in total_requests but
+    leave total_errors, surfacing as total_cancelled instead."""
+    repo = ReportsRepository(async_session)
+    base = datetime(2026, 6, 1, 12, 0)
+    async_session.add(_make_account("acc_reports_cx", "reports-cx@example.com"))
+    statuses = [
+        ("success", None),
+        ("cancelled", "client_disconnected"),
+        ("cancelled", "client_disconnected"),
+        ("error", "upstream_500"),
+    ]
+    async_session.add_all(
+        [
+            RequestLog(
+                account_id="acc_reports_cx",
+                request_id=f"report-cx-{index}",
+                requested_at=base + timedelta(minutes=index),
+                model="gpt-5.1",
+                status=status,
+                error_code=error_code,
+                input_tokens=10,
+                output_tokens=5,
+                cached_input_tokens=0,
+                cost_usd=0.1,
+            )
+            for index, (status, error_code) in enumerate(statuses)
+        ]
+    )
+    await async_session.commit()
+
+    summary = await repo.aggregate_summary(base - timedelta(hours=1), base + timedelta(hours=1))
+
+    assert summary.total_requests == 4
+    assert summary.total_errors == 1
+    assert summary.total_cancelled == 2
+
+
+@pytest.mark.asyncio
+async def test_report_conversation_aggregates_are_distinct_nonblank_filtered_and_daily(
+    async_session: AsyncSession,
+) -> None:
+    repo = ReportsRepository(async_session)
+    async_session.add_all(
+        [
+            _make_account("acc_reports_conversations", "reports-conversations@example.com"),
+            _make_account("acc_reports_other", "reports-other@example.com"),
+            RequestLog(
+                account_id="acc_reports_conversations",
+                request_id="report-conversation-span-1",
+                requested_at=datetime(2026, 6, 1, 10, 0),
+                model="gpt-5.1",
+                useragent_group="opencode",
+                status="success",
+                conversation_id="conv-span",
+            ),
+            RequestLog(
+                account_id="acc_reports_conversations",
+                request_id="report-conversation-span-duplicate",
+                requested_at=datetime(2026, 6, 1, 11, 0),
+                model="gpt-5.1",
+                useragent_group="opencode",
+                status="success",
+                conversation_id="conv-span",
+            ),
+            RequestLog(
+                account_id="acc_reports_conversations",
+                request_id="report-conversation-span-2",
+                requested_at=datetime(2026, 6, 2, 10, 0),
+                model="gpt-5.1",
+                useragent_group="opencode",
+                status="success",
+                conversation_id="conv-span",
+            ),
+            RequestLog(
+                account_id="acc_reports_conversations",
+                request_id="report-conversation-other",
+                requested_at=datetime(2026, 6, 2, 11, 0),
+                model="gpt-5.1",
+                useragent_group="opencode",
+                status="success",
+                conversation_id="conv-other",
+            ),
+            RequestLog(
+                account_id="acc_reports_conversations",
+                request_id="report-conversation-null",
+                requested_at=datetime(2026, 6, 2, 12, 0),
+                model="gpt-5.1",
+                useragent_group="opencode",
+                status="success",
+                conversation_id=None,
+            ),
+            RequestLog(
+                account_id="acc_reports_conversations",
+                request_id="report-conversation-empty",
+                requested_at=datetime(2026, 6, 2, 13, 0),
+                model="gpt-5.1",
+                useragent_group="opencode",
+                status="success",
+                conversation_id="",
+            ),
+            RequestLog(
+                account_id="acc_reports_conversations",
+                request_id="report-conversation-whitespace",
+                requested_at=datetime(2026, 6, 2, 14, 0),
+                model="gpt-5.1",
+                useragent_group="opencode",
+                status="success",
+                conversation_id="   ",
+            ),
+            RequestLog(
+                account_id="acc_reports_conversations",
+                request_id="report-conversation-warmup",
+                requested_at=datetime(2026, 6, 2, 15, 0),
+                model="gpt-5.1",
+                useragent_group="opencode",
+                status="success",
+                request_kind="warmup",
+                conversation_id="conv-warmup",
+            ),
+            RequestLog(
+                account_id="acc_reports_other",
+                request_id="report-conversation-other-account",
+                requested_at=datetime(2026, 6, 1, 10, 0),
+                model="gpt-5.1",
+                useragent_group="opencode",
+                status="success",
+                conversation_id="conv-filtered-account",
+            ),
+            RequestLog(
+                account_id="acc_reports_conversations",
+                request_id="report-conversation-other-model",
+                requested_at=datetime(2026, 6, 1, 10, 0),
+                model="gpt-5.2",
+                useragent_group="opencode",
+                status="success",
+                conversation_id="conv-filtered-model",
+            ),
+            RequestLog(
+                account_id="acc_reports_conversations",
+                request_id="report-conversation-other-useragent",
+                requested_at=datetime(2026, 6, 1, 10, 0),
+                model="gpt-5.1",
+                useragent_group="CodexCLI",
+                status="success",
+                conversation_id="conv-filtered-useragent",
+            ),
+        ]
+    )
+    await async_session.commit()
+
+    summary = await repo.aggregate_summary(
+        datetime(2026, 6, 1),
+        datetime(2026, 6, 3),
+        account_ids=["acc_reports_conversations"],
+        model="gpt-5.1",
+        useragent_group="opencode",
+    )
+    daily_rows = await repo.aggregate_daily_rows(
+        date(2026, 6, 1),
+        date(2026, 6, 2),
+        timezone.utc,
+        account_ids=["acc_reports_conversations"],
+        model="gpt-5.1",
+        useragent_group="opencode",
+    )
+
+    assert summary.conversation_count == 2
+    assert [(row.date, row.conversation_count) for row in daily_rows] == [("2026-06-01", 1), ("2026-06-02", 2)]
+
+
+@pytest.mark.asyncio
+async def test_report_conversation_aggregates_exclude_tab_and_newline_only_ids(
+    async_session: AsyncSession,
+) -> None:
+    repo = ReportsRepository(async_session)
+    async_session.add_all(
+        [
+            RequestLog(
+                request_id="report-conversation-tab-only",
+                requested_at=datetime(2026, 6, 1, 10, 0),
+                model="gpt-5.1",
+                status="success",
+                conversation_id="\t",
+            ),
+            RequestLog(
+                request_id="report-conversation-newline-only",
+                requested_at=datetime(2026, 6, 1, 11, 0),
+                model="gpt-5.1",
+                status="success",
+                conversation_id="\n",
+            ),
+        ]
+    )
+    await async_session.commit()
+
+    summary = await repo.aggregate_summary(datetime(2026, 6, 1), datetime(2026, 6, 2))
+    daily_rows = await repo.aggregate_daily_rows(date(2026, 6, 1), date(2026, 6, 1), timezone.utc)
+
+    assert summary.conversation_count == 0
+    assert daily_rows[0].conversation_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case_name", "rows", "filters", "start_at", "end_at", "expected"),
+    [
+        (
+            "duplicate_dedupe",
+            [{"conversation_id": "conv-duplicate"}, {"conversation_id": "conv-duplicate"}],
+            {},
+            datetime(2026, 6, 1),
+            datetime(2026, 6, 2),
+            1,
+        ),
+        ("null_id", [{"conversation_id": None}], {}, datetime(2026, 6, 1), datetime(2026, 6, 2), 0),
+        ("empty_id", [{"conversation_id": ""}], {}, datetime(2026, 6, 1), datetime(2026, 6, 2), 0),
+        ("space_only_id", [{"conversation_id": "   "}], {}, datetime(2026, 6, 1), datetime(2026, 6, 2), 0),
+        ("tab_only_id", [{"conversation_id": "\t"}], {}, datetime(2026, 6, 1), datetime(2026, 6, 2), 0),
+        ("newline_only_id", [{"conversation_id": "\n"}], {}, datetime(2026, 6, 1), datetime(2026, 6, 2), 0),
+        (
+            "warmup_traffic",
+            [{"conversation_id": "conv-warmup", "request_kind": "warmup"}],
+            {},
+            datetime(2026, 6, 1),
+            datetime(2026, 6, 2),
+            0,
+        ),
+        (
+            "abnormal_source_traffic",
+            [{"conversation_id": "conv-source-warmup", "source": "limit_warmup"}],
+            {},
+            datetime(2026, 6, 1),
+            datetime(2026, 6, 2),
+            0,
+        ),
+        (
+            "account_filter",
+            [
+                {"account_id": "acc-selected", "conversation_id": "conv-selected-account"},
+                {"account_id": "acc-other", "conversation_id": "conv-other-account"},
+            ],
+            {"account_ids": ["acc-selected"]},
+            datetime(2026, 6, 1),
+            datetime(2026, 6, 2),
+            1,
+        ),
+        (
+            "model_filter",
+            [
+                {"model": "gpt-selected", "conversation_id": "conv-selected-model"},
+                {"model": "gpt-other", "conversation_id": "conv-other-model"},
+            ],
+            {"model": "gpt-selected"},
+            datetime(2026, 6, 1),
+            datetime(2026, 6, 2),
+            1,
+        ),
+        (
+            "useragent_filter",
+            [
+                {"useragent_group": "opencode", "conversation_id": "conv-selected-useragent"},
+                {"useragent_group": "CodexCLI", "conversation_id": "conv-other-useragent"},
+            ],
+            {"useragent_group": "opencode"},
+            datetime(2026, 6, 1),
+            datetime(2026, 6, 2),
+            1,
+        ),
+        (
+            "out_of_range_date",
+            [{"requested_at": datetime(2026, 6, 3), "conversation_id": "conv-out-of-range"}],
+            {},
+            datetime(2026, 6, 1),
+            datetime(2026, 6, 2),
+            0,
+        ),
+    ],
+    ids=[
+        "duplicate_dedupe",
+        "null_id",
+        "empty_id",
+        "space_only_id",
+        "tab_only_id",
+        "newline_only_id",
+        "warmup_traffic",
+        "abnormal_source_traffic",
+        "account_filter",
+        "model_filter",
+        "useragent_filter",
+        "out_of_range_date",
+    ],
+)
+async def test_report_conversation_aggregate_rules_are_independently_counted(
+    async_session: AsyncSession,
+    case_name: str,
+    rows: list[dict[str, object]],
+    filters: ReportAggregateFilters,
+    start_at: datetime,
+    end_at: datetime,
+    expected: int,
+) -> None:
+    del case_name
+    async_session.add_all(
+        [
+            RequestLog(
+                request_id=f"report-conversation-rule-{index}",
+                requested_at=row.get("requested_at", start_at),
+                model=row.get("model", "gpt-5.1"),
+                status="success",
+                account_id=row.get("account_id"),
+                useragent_group=row.get("useragent_group"),
+                source=row.get("source"),
+                request_kind=row.get("request_kind", "normal"),
+                conversation_id=row.get("conversation_id"),
+            )
+            for index, row in enumerate(rows)
+        ]
+    )
+    await async_session.commit()
+
+    summary = await ReportsRepository(async_session).aggregate_summary(
+        start_at,
+        end_at,
+        account_ids=filters.get("account_ids"),
+        model=filters.get("model"),
+        useragent_group=filters.get("useragent_group"),
+    )
+
+    assert summary.conversation_count == expected
 
 
 @pytest.mark.asyncio
@@ -132,7 +492,7 @@ async def test_aggregate_daily_rows_calculates_sql_medians_for_odd_even_and_inva
     async_session.add_all(
         [
             # Day one ignores missing TTFT and invalid TPS samples: TTFT [100, 200, 300], TPS [10].
-            # Reasoning tokens are not used for the existing output TPS metric.
+            # TPS excludes the two reasoning tokens from the valid sample.
             RequestLog(
                 account_id=account_id,
                 request_id="report-speed-even-1",
@@ -151,8 +511,8 @@ async def test_aggregate_daily_rows_calculates_sql_medians_for_odd_even_and_inva
                 requested_at=datetime(2026, 6, 1, 10, 0),
                 model="gpt-5.1",
                 status="success",
-                output_tokens=12,
-                reasoning_tokens=999,
+                output_tokens=14,
+                reasoning_tokens=2,
                 latency_ms=1500,
                 latency_first_token_ms=300,
                 latency_queue_ms=60,

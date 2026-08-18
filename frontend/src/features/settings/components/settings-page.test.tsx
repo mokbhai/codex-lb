@@ -1,4 +1,7 @@
 import { render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import userEvent from "@testing-library/user-event";
+import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SettingsPage } from "@/features/settings/components/settings-page";
@@ -17,6 +20,8 @@ const firewallSectionMock = vi.fn();
 const quotaPlannerSectionMock = vi.fn();
 const stickySessionsSectionMock = vi.fn();
 const modelSourcesSettingsMock = vi.fn();
+const dataRetentionSettingsMock = vi.fn();
+const telemetrySettingsMock = vi.fn();
 
 vi.mock("@/features/settings/hooks/use-settings", () => ({
   useSettings: () => useSettingsMock(),
@@ -65,6 +70,20 @@ vi.mock("@/features/settings/components/password-settings", () => ({
 
 vi.mock("@/features/settings/components/session-settings", () => ({
   SessionSettings: () => <div>Session Settings</div>,
+}));
+
+vi.mock("@/features/settings/components/data-retention-settings", () => ({
+  DataRetentionSettings: (props: unknown) => {
+    dataRetentionSettingsMock(props);
+    return <div>Data Retention Settings</div>;
+  },
+}));
+
+vi.mock("@/features/settings/components/telemetry-settings", () => ({
+  TelemetrySettings: (props: unknown) => {
+    telemetrySettingsMock(props);
+    return <div>Telemetry Settings</div>;
+  },
 }));
 
 vi.mock("@/features/api-keys/components/api-keys-section", () => ({
@@ -151,28 +170,94 @@ describe("SettingsPage", () => {
     firewallSectionMock.mockReset();
     quotaPlannerSectionMock.mockReset();
     stickySessionsSectionMock.mockReset();
+    modelSourcesSettingsMock.mockReset();
+    dataRetentionSettingsMock.mockReset();
+    telemetrySettingsMock.mockReset();
   });
 
-  it("disables write-capable sections for read-only guests", () => {
+  function renderSettings(initialEntry = "/settings") {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={[initialEntry]}>
+          <SettingsPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+
+  async function expandAdvancedSettings() {
+    const user = userEvent.setup({ delay: null });
+    await user.click(screen.getByRole("button", { name: "Show advanced settings" }));
+  }
+
+  it("keeps advanced sections collapsed and unmounted by default", () => {
+    renderSettings();
+
+    expect(screen.getByRole("button", { name: "Show advanced settings" })).toBeInTheDocument();
+    expect(screen.queryByText("Routing Settings")).not.toBeInTheDocument();
+    expect(screen.queryByText("Upstream Proxy Settings")).not.toBeInTheDocument();
+    expect(screen.queryByText("Model Sources Settings")).not.toBeInTheDocument();
+    expect(screen.queryByText("Firewall Section")).not.toBeInTheDocument();
+    expect(screen.queryByText("Quota Planner Section")).not.toBeInTheDocument();
+    expect(screen.queryByText("Sticky Sessions Section")).not.toBeInTheDocument();
+    expect(screen.queryByText("Data Retention Settings")).not.toBeInTheDocument();
+    expect(routingSettingsMock).not.toHaveBeenCalled();
+    expect(upstreamProxySettingsMock).not.toHaveBeenCalled();
+    expect(modelSourcesSettingsMock).not.toHaveBeenCalled();
+    expect(firewallSectionMock).not.toHaveBeenCalled();
+    expect(quotaPlannerSectionMock).not.toHaveBeenCalled();
+    expect(stickySessionsSectionMock).not.toHaveBeenCalled();
+    expect(dataRetentionSettingsMock).not.toHaveBeenCalled();
+
+    // Core sections stay visible without any interaction.
+    expect(screen.getByText("Appearance Settings")).toBeInTheDocument();
+    expect(screen.getByText("Import Settings")).toBeInTheDocument();
+    expect(screen.getByText("API Keys Section")).toBeInTheDocument();
+    expect(screen.getByText("Telemetry Settings")).toBeInTheDocument();
+  });
+
+  it("mounts every advanced section after one expand interaction", async () => {
+    renderSettings();
+
+    await expandAdvancedSettings();
+
+    expect(screen.getByText("Routing Settings")).toBeInTheDocument();
+    expect(screen.getByText("Upstream Proxy Settings")).toBeInTheDocument();
+    expect(screen.getByText("Model Sources Settings")).toBeInTheDocument();
+    expect(screen.getByText("Firewall Section")).toBeInTheDocument();
+    expect(screen.getByText("Quota Planner Section")).toBeInTheDocument();
+    expect(screen.getByText("Sticky Sessions Section")).toBeInTheDocument();
+    expect(screen.getByText("Data Retention Settings")).toBeInTheDocument();
+  });
+
+  it("disables write-capable sections for read-only guests", async () => {
     useAuthStore.setState({ canWrite: false });
 
-    render(<SettingsPage />);
+    renderSettings();
 
     expect(screen.getByText("You are viewing the dashboard with read-only guest access. Admin controls are disabled.")).toBeInTheDocument();
     expect(screen.queryByText("Guest Access Settings")).not.toBeInTheDocument();
     expect(screen.queryByText("Password Settings")).not.toBeInTheDocument();
     expect(screen.queryByText("Session Settings")).not.toBeInTheDocument();
-    expect(routingSettingsMock).toHaveBeenCalledWith(expect.objectContaining({ busy: true }));
-    expect(upstreamProxySettingsMock).toHaveBeenCalledWith(expect.objectContaining({ busy: true }));
     expect(importSettingsMock).toHaveBeenCalledWith(expect.objectContaining({ busy: true }));
     expect(apiKeysSectionMock).toHaveBeenCalledWith(expect.objectContaining({ disabled: true }));
+    expect(telemetrySettingsMock).toHaveBeenCalledWith(expect.objectContaining({ disabled: true }));
+
+    await expandAdvancedSettings();
+
+    expect(routingSettingsMock).toHaveBeenCalledWith(expect.objectContaining({ busy: true }));
+    expect(upstreamProxySettingsMock).toHaveBeenCalledWith(expect.objectContaining({ busy: true }));
     expect(firewallSectionMock).toHaveBeenCalledWith(expect.objectContaining({ disabled: true }));
     expect(quotaPlannerSectionMock).toHaveBeenCalledWith(expect.objectContaining({ disabled: true }));
     expect(stickySessionsSectionMock).toHaveBeenCalledWith(expect.objectContaining({ disabled: true }));
+    expect(dataRetentionSettingsMock).toHaveBeenCalledWith(expect.objectContaining({ busy: true }));
   });
 
-  it("keeps guest access settings available for writable sessions", () => {
-    render(<SettingsPage />);
+  it("keeps guest access settings available for writable sessions", async () => {
+    renderSettings();
 
     expect(screen.getByText("Guest Access Settings")).toBeInTheDocument();
     expect(guestAccessSettingsMock).toHaveBeenCalledWith(
@@ -181,6 +266,18 @@ describe("SettingsPage", () => {
         busy: false,
       }),
     );
+
+    await expandAdvancedSettings();
+
     expect(routingSettingsMock).toHaveBeenCalledWith(expect.objectContaining({ busy: false }));
   });
+
+  it("expands Advanced and mounts firewall on the advanced deeplink", () => {
+    renderSettings("/settings?advanced=1#firewall");
+
+    expect(screen.getByText("Firewall Section")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Hide advanced settings" })).toBeInTheDocument();
+    expect(firewallSectionMock).toHaveBeenCalled();
+  });
+
 });

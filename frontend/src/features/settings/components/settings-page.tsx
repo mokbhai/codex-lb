@@ -1,6 +1,7 @@
 import { Suspense, lazy } from "react";
 import { Settings } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { useLocation } from "react-router-dom";
 
 import { AlertMessage } from "@/components/alert-message";
 import { LoadingOverlay } from "@/components/layout/loading-overlay";
@@ -10,13 +11,18 @@ import { FirewallSection } from "@/features/firewall/components/firewall-section
 import { ModelSourcesSettings } from "@/features/model-sources/components/model-sources-settings";
 import { QuotaPlannerSection } from "@/features/quota-planner/components/quota-planner-section";
 import { buildSettingsUpdateRequest } from "@/features/settings/payload";
+import { shouldExpandAdvancedSettings } from "@/features/settings/advanced-settings-deeplink";
+import { AdvancedSettingsGroup } from "@/features/settings/components/advanced-settings-group";
 import { AppearanceSettings } from "@/features/settings/components/appearance-settings";
+import { DataRetentionSettings } from "@/features/settings/components/data-retention-settings";
 import { GuestAccessSettings } from "@/features/settings/components/guest-access-settings";
 import { ImportSettings } from "@/features/settings/components/import-settings";
 import { PasswordSettings } from "@/features/settings/components/password-settings";
+import { ResetCreditSettings } from "@/features/settings/components/reset-credit-settings";
 import { RoutingSettings } from "@/features/settings/components/routing-settings";
 import { SessionSettings } from "@/features/settings/components/session-settings";
 import { SettingsSkeleton } from "@/features/settings/components/settings-skeleton";
+import { TelemetrySettings } from "@/features/settings/components/telemetry-settings";
 import { UpstreamProxySettings } from "@/features/settings/components/upstream-proxy-settings";
 import { StickySessionsSection } from "@/features/sticky-sessions/components/sticky-sessions-section";
 import { useAuthStore } from "@/features/auth/hooks/use-auth";
@@ -28,8 +34,17 @@ const TotpSettings = lazy(() =>
   import("@/features/settings/components/totp-settings").then((m) => ({ default: m.TotpSettings })),
 );
 
+const FIREWALL_LAYOUT_QUERY_KEYS = [
+  ["accounts", "list"],
+  ["settings", "upstream-proxy"],
+  ["model-sources", "list"],
+] as const;
+
 export function SettingsPage() {
   const { t } = useTranslation();
+  const location = useLocation();
+  const expandAdvanced = shouldExpandAdvancedSettings(location.search, location.hash);
+  const advancedScrollToId = location.hash.replace(/^#/, "") || undefined;
   const { settingsQuery, updateSettingsMutation } = useSettings();
   const { accountsQuery } = useAccounts();
   const {
@@ -101,41 +116,8 @@ export function SettingsPage() {
 
           <div className="space-y-4">
             <AppearanceSettings />
-            <RoutingSettings
-              key={[
-                settings.openaiCacheAffinityMaxAgeSeconds,
-                settings.warmupModel,
-                settings.limitWarmupModel,
-                settings.limitWarmupPrompt,
-                settings.limitWarmupExhaustedThresholdPercent,
-                settings.limitWarmupIdleThresholdPercent,
-                settings.limitWarmupCooldownSeconds,
-                settings.limitWarmupStaggeredIdleEnabled,
-                settings.proxyAccountResponseCreateLimit,
-                settings.proxyAccountStreamLimit,
-                settings.proxyAccountStreamRecoveryReserve,
-              ].join(":")}
-              settings={settings}
-              accounts={accountsQuery.data ?? []}
-              accountsLoading={accountsQuery.isLoading}
-              busy={controlsDisabled}
-              onSave={handleSave}
-            />
-            {upstreamProxyQuery.data ? (
-              <UpstreamProxySettings
-                admin={upstreamProxyQuery.data}
-                busy={controlsDisabled}
-                onSaveSettings={handleSave}
-                onCreateEndpoint={(payload) => createEndpointMutation.mutateAsync(payload)}
-                onTestEndpoint={(endpointId) => testEndpointMutation.mutateAsync(endpointId)}
-                onCreatePool={(payload) => createPoolMutation.mutateAsync(payload)}
-                onAddPoolMember={(poolId, payload) =>
-                  addPoolMemberMutation.mutateAsync({ poolId, payload })
-                }
-              />
-            ) : null}
             <ImportSettings settings={settings} busy={controlsDisabled} onSave={handleSave} />
-            <ModelSourcesSettings disabled={controlsDisabled} />
+            <ResetCreditSettings settings={settings} busy={controlsDisabled} onSave={handleSave} />
             {canWrite ? (
               <GuestAccessSettings
                 settings={settings}
@@ -165,9 +147,65 @@ export function SettingsPage() {
                 void handleSave(buildSettingsUpdateRequest(settings, { hideUpstreamQuotaFromApiKeys: enabled }))
               }
             />
-            <FirewallSection disabled={controlsDisabled} />
-            <QuotaPlannerSection disabled={controlsDisabled} />
-            <StickySessionsSection disabled={controlsDisabled} />
+
+            <TelemetrySettings disabled={controlsDisabled} />
+
+            <AdvancedSettingsGroup
+              key={expandAdvanced ? `open:${advancedScrollToId ?? ""}` : "closed"}
+              defaultOpen={expandAdvanced}
+              scrollToId={advancedScrollToId}
+              waitForQueryKeys={FIREWALL_LAYOUT_QUERY_KEYS}
+            >
+              <RoutingSettings
+                key={[
+                  settings.openaiCacheAffinityMaxAgeSeconds,
+                  settings.warmupModel,
+                  settings.limitWarmupModel,
+                  settings.limitWarmupPrompt,
+                  settings.limitWarmupExhaustedThresholdPercent,
+                  settings.limitWarmupIdleThresholdPercent,
+                  settings.limitWarmupCooldownSeconds,
+                  settings.limitWarmupStaggeredIdleEnabled,
+                  settings.proxyAccountResponseCreateLimit,
+                  settings.proxyAccountStreamLimit,
+                  settings.proxyAccountStreamRecoveryReserve,
+                  settings.proxyApiKeyFairShareCongestionThresholdPct,
+                ].join(":")}
+                settings={settings}
+                accounts={accountsQuery.data ?? []}
+                accountsLoading={accountsQuery.isLoading}
+                busy={controlsDisabled}
+                onSave={handleSave}
+              />
+              {upstreamProxyQuery.data ? (
+                <UpstreamProxySettings
+                  admin={upstreamProxyQuery.data}
+                  busy={controlsDisabled}
+                  onSaveSettings={handleSave}
+                  onCreateEndpoint={(payload) => createEndpointMutation.mutateAsync(payload)}
+                  onTestEndpoint={(endpointId) => testEndpointMutation.mutateAsync(endpointId)}
+                  onCreatePool={(payload) => createPoolMutation.mutateAsync(payload)}
+                  onAddPoolMember={(poolId, payload) =>
+                    addPoolMemberMutation.mutateAsync({ poolId, payload })
+                  }
+                />
+              ) : null}
+              <ModelSourcesSettings disabled={controlsDisabled} />
+              <FirewallSection disabled={controlsDisabled} />
+              <QuotaPlannerSection disabled={controlsDisabled} />
+              <StickySessionsSection disabled={controlsDisabled} />
+              <DataRetentionSettings
+                key={[
+                  settings.requestLogRetentionOverrideDays,
+                  settings.usageHistoryRetentionOverrideDays,
+                  settings.requestLogRetentionDays,
+                  settings.usageHistoryRetentionDays,
+                ].join(":")}
+                settings={settings}
+                busy={controlsDisabled}
+                onSave={handleSave}
+              />
+            </AdvancedSettingsGroup>
           </div>
 
           <LoadingOverlay visible={!!settings && busy} label={t("settings.page.savingLabel")} />

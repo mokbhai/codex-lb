@@ -19,12 +19,14 @@ from app.core.auth.dashboard_access import (
     guest_principal,
 )
 from app.core.auth.dashboard_mode import DashboardAuthMode, get_dashboard_request_auth
+from app.core.clients.proxy import CODEX_LB_REQUIRED_CAPABILITY_HEADER
 from app.core.clients.usage import UsageFetchError, fetch_usage
 from app.core.config.settings import get_settings
 from app.core.config.settings_cache import get_settings_cache
 from app.core.crypto import TokenEncryptor
 from app.core.exceptions import DashboardAuthError, DashboardPermissionError, ProxyAuthError, ProxyUpstreamError
 from app.core.request_locality import is_local_request
+from app.core.socket_peer import raw_socket_peer_host
 from app.core.upstream_proxy import UpstreamProxyRouteError, resolve_upstream_route
 from app.core.utils.time import utcnow
 from app.db.models import AccountStatus
@@ -62,7 +64,11 @@ async def validate_proxy_api_key(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Security(_bearer),
 ) -> ApiKeyData | None:
+    """A required-capability header authenticates even when global proxy API-key auth is disabled."""
+
     authorization = None if credentials is None else f"Bearer {credentials.credentials}"
+    if request.headers.getlist(CODEX_LB_REQUIRED_CAPABILITY_HEADER):
+        return await validate_required_proxy_api_key_authorization(authorization)
     return await validate_proxy_api_key_authorization(authorization, request=request)
 
 
@@ -82,6 +88,15 @@ async def validate_proxy_api_key_authorization(
     if not token:
         raise ProxyAuthError("Missing API key in Authorization header")
 
+    return await _validate_api_key_token(token)
+
+
+async def validate_required_proxy_api_key_authorization(authorization: str | None) -> ApiKeyData:
+    """Validate a proxy API key even when global proxy auth is disabled."""
+
+    token = _extract_bearer_token(authorization)
+    if not token:
+        raise ProxyAuthError("Missing API key in Authorization header")
     return await _validate_api_key_token(token)
 
 
@@ -108,6 +123,16 @@ async def _validate_api_key_token(token: str) -> ApiKeyData:
             raise ProxyAuthError(str(exc)) from exc
 
 
+async def validate_required_proxy_api_key(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Security(_bearer),
+) -> ApiKeyData:
+    """Require a valid proxy API key regardless of the global auth setting."""
+
+    authorization = None if credentials is None else f"Bearer {credentials.credentials}"
+    return await validate_required_proxy_api_key_authorization(authorization)
+
+
 # --- Self-service usage endpoint auth (always requires valid key) ---
 
 
@@ -121,11 +146,8 @@ async def validate_usage_api_key(
     Bearer API key, regardless of the global ``api_key_auth_enabled`` setting.
     Raises ProxyAuthError when the key is missing or invalid.
     """
-    token = _extract_bearer_token(None if credentials is None else f"Bearer {credentials.credentials}")
-    if not token:
-        raise ProxyAuthError("Missing API key in Authorization header")
-
-    return await _validate_api_key_token(token)
+    authorization = None if credentials is None else f"Bearer {credentials.credentials}"
+    return await validate_required_proxy_api_key_authorization(authorization)
 
 
 # --- Dashboard session auth ---
@@ -235,6 +257,20 @@ async def require_dashboard_write_access(request: Request) -> DashboardPrincipal
     return principal
 
 
+def ensure_dashboard_admin_access(principal: DashboardPrincipal) -> None:
+    if principal.role != DashboardRole.ADMIN:
+        raise DashboardPermissionError(
+            "Admin dashboard access is required to view sensitive data",
+            code="admin_access_required",
+        )
+
+
+async def require_dashboard_admin_access(request: Request) -> DashboardPrincipal:
+    principal = await validate_dashboard_session(request)
+    ensure_dashboard_admin_access(principal)
+    return principal
+
+
 def get_dashboard_request_auth_mode() -> DashboardAuthMode:
     from app.core.config.settings import get_settings
 
@@ -242,7 +278,7 @@ def get_dashboard_request_auth_mode() -> DashboardAuthMode:
 
 
 def _is_proxy_unauthenticated_socket_peer_allowed(request: HTTPConnection) -> bool:
-    socket_host = request.client.host if request.client else None
+    socket_host = raw_socket_peer_host(request)
     if socket_host is None:
         return False
 
@@ -333,6 +369,14 @@ async def validate_codex_usage_identity(request: Request) -> ApiKeyData | None:
     request.state.codex_usage_identity_route = route
     request.state.codex_usage_identity_payload = usage_payload
     return None
+
+
+async def validate_codex_provider_usage_identity(request: Request) -> ApiKeyData | None:
+    """Bind provider capability intent to a proxy API-key principal before usage I/O."""
+
+    if request.headers.getlist(CODEX_LB_REQUIRED_CAPABILITY_HEADER):
+        return await validate_required_proxy_api_key_authorization(request.headers.get("authorization"))
+    return await validate_codex_usage_identity(request)
 
 
 def _extract_bearer_token(authorization: str | None) -> str | None:

@@ -26,11 +26,13 @@ vi.mock("@/components/lazy-recharts", async (importOriginal) => {
 
 const BASE_ROW = {
   requests: 10,
+  conversations: 0,
   inputTokens: 1_000,
   outputTokens: 100,
   cachedInputTokens: 0,
   costUsd: 0.5,
   activeAccounts: 1,
+  cancelledCount: 0,
   errorCount: 0,
   medianTtftMs: 200,
   medianTps: 25,
