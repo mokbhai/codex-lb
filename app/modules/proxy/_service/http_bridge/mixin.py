@@ -46,6 +46,7 @@ from app.core.metrics.prometheus import (
     bridge_soft_local_rebind_total,
 )
 from app.core.utils.request_id import ensure_request_scope_id
+from app.core.utils.shared_future import wait_on_shared_future
 from app.db.models import (
     AccountStatus,
     StickySessionKind,
@@ -1365,8 +1366,11 @@ class _HTTPBridgeMixin(
             if capacity_wait_future is not None:
                 wait_timeout_seconds = _proxy_admission_wait_timeout_seconds(settings)
                 try:
-                    await asyncio.wait_for(
-                        asyncio.shield(capacity_wait_future),
+                    # Not wait_for(shield(...)): shield attaches per-waiter
+                    # callbacks to the shared registry future, which livelocks
+                    # the event loop under mass timeout (see shared_future.py).
+                    await wait_on_shared_future(
+                        capacity_wait_future,
                         timeout=wait_timeout_seconds,
                     )
                 except asyncio.CancelledError:
@@ -1396,8 +1400,11 @@ class _HTTPBridgeMixin(
             if inflight_future is not None and not owns_creation:
                 wait_timeout_seconds = _proxy_admission_wait_timeout_seconds(settings)
                 try:
-                    session = await asyncio.wait_for(
-                        asyncio.shield(inflight_future),
+                    # Not wait_for(shield(...)): shield attaches per-waiter
+                    # callbacks to the shared registry future, which livelocks
+                    # the event loop under mass timeout (see shared_future.py).
+                    session = await wait_on_shared_future(
+                        inflight_future,
                         timeout=wait_timeout_seconds,
                     )
                 except asyncio.CancelledError:

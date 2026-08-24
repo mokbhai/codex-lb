@@ -1272,6 +1272,46 @@
         "code",
         "test"
       ]
+    },
+    {
+      "login": "evan-choi",
+      "name": "Evan",
+      "avatar_url": "https://avatars.githubusercontent.com/u/9690415?v=4",
+      "profile": "https://github.com/evan-choi",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "chaoxu",
+      "name": "Chao Xu",
+      "avatar_url": "https://avatars.githubusercontent.com/u/18860?v=4",
+      "profile": "https://chaoxu.prof/",
+      "contributions": [
+        "code",
+        "test"
+      ]
+    },
+    {
+      "login": "zenasharp",
+      "name": "zenasharp",
+      "avatar_url": "https://avatars.githubusercontent.com/u/170236008?v=4",
+      "profile": "https://github.com/zenasharp",
+      "contributions": [
+        "code",
+        "test",
+        "doc"
+      ]
+    },
+    {
+      "login": "hanseo0507",
+      "name": "HanSu Lee",
+      "avatar_url": "https://avatars.githubusercontent.com/u/56479293?v=4",
+      "profile": "https://github.com/hanseo0507",
+      "contributions": [
+        "code",
+        "test"
+      ]
     }
   ],
   "contributorsPerLine": 7,

@@ -95,6 +95,9 @@ from app.modules.proxy._service.http_bridge.helpers import (
 from app.modules.proxy._service.http_bridge.quarantine import (
     _record_http_bridge_quarantine_wedged_pending,
 )
+from app.modules.proxy._service.http_bridge.retry_circuit import (
+    _http_bridge_anchor_poison_detail,
+)
 from app.modules.proxy._service.http_bridge.service_stubs import (
     _call_with_supported_optional_kwargs,
     _classify_upstream_close,
@@ -122,6 +125,10 @@ from app.modules.proxy._service.http_bridge.service_stubs import (
     _upstream_response_create_max_bytes,
     _websocket_auth_failure_permanent_code,
     _websocket_auth_failure_requires_reauth,
+    _websocket_request_text_is_account_neutral_fresh_replay,
+)
+from app.modules.proxy._service.http_bridge.upstream_events import (
+    _abandon_durable_http_bridge_continuity,
 )
 from app.modules.proxy._service.observability import (
     _hash_identifier as _hash_identifier,
@@ -2845,11 +2852,41 @@ class _HTTPBridgeRequestSubmitMixin:
         # that handoff, genuine pre-response failures disappear from circuit
         # accounting while idle closes and request failures look identical.
         if retired_request_count > 0 and response_events_seen == 0:
-            await self._record_http_bridge_retry_circuit_failure_for_attempt_selection(
+            consecutive_failures = await self._record_http_bridge_retry_circuit_failure_for_attempt_selection(
                 session,
                 detail=retry_circuit_detail or detail,
                 selection=retry_circuit_attempt_selection,
             )
+            poison_detail = _http_bridge_anchor_poison_detail(retry_circuit_detail or detail)
+            if (
+                poison_detail is not None
+                and consecutive_failures is not None
+                and consecutive_failures
+                >= _service_get_settings().http_responses_session_bridge_anchor_poison_failure_threshold
+            ):
+                # Consecutive eventless failures on one bridge key are
+                # same-anchor failures (the anchor only advances on a
+                # completed response, which resets the circuit). Clear the
+                # poisoned durable anchor while this session still owns the
+                # lease so the next attempt is not re-anchored into the same
+                # failure. Without this, only the admission-waiter reader
+                # path could ever poison an anchor, and an anchored session
+                # failing without waiters cooled down forever (issue #1830).
+                durable_cleared = await _abandon_durable_http_bridge_continuity(self, session, detail=poison_detail)
+                if not durable_cleared and session.durable_session_id is not None:
+                    # Keep failed waiterless clears visible in the same
+                    # poison-clear telemetry the admission-waiter path emits;
+                    # the next threshold failure re-attempts the clear.
+                    _log_http_bridge_event(
+                        "durable_anchor_poison_clear_failed",
+                        session.key,
+                        account_id=session.account.id,
+                        model=session.request_model,
+                        pending_count=retired_request_count,
+                        detail=poison_detail,
+                        cache_key_family=session.key.affinity_kind,
+                        model_class=_extract_model_class(session.request_model) if session.request_model else None,
+                    )
         session.closed = True
         async with self._http_bridge_lock:
             # Bounded close may return while resource finalization is still
@@ -3094,6 +3131,7 @@ class _HTTPBridgeRequestSubmitMixin:
             )
             if request_state.replay_count >= 1 and not additional_clean_close_retry:
                 return False
+            account_bound_replay = False
             if request_state.previous_response_id is not None:
                 require_preferred_reconnect = False
                 if account_neutral_recovery:
@@ -3125,11 +3163,26 @@ class _HTTPBridgeRequestSubmitMixin:
                 # Account-scoped uploaded files cannot be replayed on a
                 # different owner. Keep the preferred account mandatory for
                 # both silent recovery and clean-close recovery.
-                require_preferred_reconnect = account_neutral_recovery or request_state.file_required_preferred_account
+                candidate_text = (
+                    request_state.fresh_upstream_request_text
+                    if request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text
+                    else request_state.request_text
+                )
+                # The send boundary decorates durable operations with
+                # codex_lb_operation_id after selection. Keep that operation
+                # identity on its owner unless a dedicated rebind path has
+                # already replaced the operation ID.
+                candidate_portable = request_state.operation_id is None and (
+                    _websocket_request_text_is_account_neutral_fresh_replay(candidate_text)
+                )
                 request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
-                if request_text is None:
+                if request_text is None or request_text != candidate_text:
                     return False
-                if account_neutral_recovery:
+                account_bound_replay = not candidate_portable
+                require_preferred_reconnect = (
+                    account_neutral_recovery or account_bound_replay or request_state.file_required_preferred_account
+                )
+                if account_neutral_recovery or account_bound_replay:
                     request_state.preferred_account_id = session.account.id
                 elif not request_state.file_required_preferred_account:
                     if hard_owner_bound and not model_fallback_replay and not fresh_hard_request_account_switch_allowed:
@@ -3210,7 +3263,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 await self._reconnect_http_bridge_session(
                     session,
                     request_state=request_state,
-                    require_same_account=account_neutral_recovery,
+                    require_same_account=account_neutral_recovery or account_bound_replay,
                     require_preferred_account=True,
                     **reconnect_reader_kwargs,
                 )
@@ -3319,7 +3372,22 @@ class _HTTPBridgeRequestSubmitMixin:
         error_message: str | None,
     ) -> Literal["not_replayable", "retried", "failed"]:
         permanent_failure_code = _websocket_auth_failure_permanent_code(error_message)
-        request_text = _prepare_websocket_request_state_for_auth_replay(request_state)
+        bound_to_current_account = request_state.replay_required_account_id == session.account.id
+        if bound_to_current_account and (
+            _websocket_auth_failure_requires_reauth(error_message)
+            or request_state.auth_replay_counts_by_account.get(session.account.id, 0) > 0
+        ):
+            failure_code = permanent_failure_code or _WEBSOCKET_AUTH_INVALIDATED_FAILURE_CODE
+            await self._load_balancer.mark_permanent_failure(session.account, failure_code)
+            setattr(request_state, "account_health_error_handled", True)
+            request_state.force_refresh_account_id = None
+            request_state.preferred_account_id = None
+            request_state.excluded_account_ids.add(session.account.id)
+            return "not_replayable"
+        request_text = _prepare_websocket_request_state_for_auth_replay(
+            request_state,
+            current_account_id=session.account.id,
+        )
         if request_text is None:
             await self._load_balancer.mark_permanent_failure(session.account, permanent_failure_code)
             setattr(request_state, "account_health_error_handled", True)
@@ -3368,10 +3436,14 @@ class _HTTPBridgeRequestSubmitMixin:
             await self._reconnect_http_bridge_session(
                 session,
                 request_state=request_state,
-                require_same_account=is_http_bridge_account_neutral_replay(
-                    kind=session.key.affinity_kind,
-                    key=session.key.affinity_key,
+                require_same_account=(
+                    bound_to_current_account
+                    or is_http_bridge_account_neutral_replay(
+                        kind=session.key.affinity_kind,
+                        key=session.key.affinity_key,
+                    )
                 ),
+                require_preferred_account=bound_to_current_account,
             )
             request_text = self._http_bridge_text_with_account_installation_id(session, request_state, request_text)
             await _send_http_bridge_request_text_with_archive_id(session, request_state, request_text)
@@ -3413,12 +3485,12 @@ class _HTTPBridgeRequestSubmitMixin:
             key=session.key.affinity_key,
         ):
             return False
-        retry_text = request_state.request_text
-        if not retry_text:
-            return False
         if request_state.file_required_preferred_account:
             return False
         if not _websocket_request_can_replay_before_visible_output(request_state):
+            return False
+        retry_text = _prepare_websocket_request_state_for_account_switch(request_state)
+        if retry_text is None:
             return False
 
         owner_account_id = session.account.id
@@ -3436,11 +3508,6 @@ class _HTTPBridgeRequestSubmitMixin:
             session.turn_state_alias_registration_generations
         )
         previous_session_headers = session.headers
-        if request_state.previous_response_id is not None:
-            retry_text = _prepare_websocket_request_state_for_account_switch(request_state)
-        if retry_text is None:
-            return False
-
         request_state.preferred_account_id = None
         request_state.excluded_account_ids.add(owner_account_id)
         request_state.affinity_policy = replace(

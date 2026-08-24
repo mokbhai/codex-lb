@@ -38,6 +38,24 @@ _HTTP_BRIDGE_RETRY_CIRCUIT_DETAIL_ALIASES = {
     "missing_response_created_timeout": "stream_idle_timeout",
     "response_create_gate_timeout_stuck_pending": "stream_idle_timeout",
 }
+_HTTP_BRIDGE_ANCHOR_POISON_DETAILS = {
+    "stream_idle_timeout": "repeated_zero_event_idle_timeout",
+    "stream_incomplete": "repeated_zero_event_stream_incomplete",
+}
+
+
+def _http_bridge_anchor_poison_detail(detail: str | None) -> str | None:
+    """Map an eventless retry-circuit failure class to its anchor-poison detail.
+
+    Consecutive eventless failures on one bridge key are same-anchor failures:
+    the durable anchor only advances on a completed response, which resets the
+    circuit. Both ambiguous transport classes therefore count toward anchor
+    poison (issue #1830); ``clean_close`` never does.
+    """
+    if detail is None:
+        return None
+    aliased = _HTTP_BRIDGE_RETRY_CIRCUIT_DETAIL_ALIASES.get(detail, detail)
+    return _HTTP_BRIDGE_ANCHOR_POISON_DETAILS.get(aliased)
 
 
 @dataclass(slots=True)

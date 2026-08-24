@@ -65,7 +65,11 @@ ENV_EXAMPLE_PATH = REPO_ROOT / ".env.example"
 # #1618). telemetry_enabled has no hardcoded default because tri-state None
 # drives the informed-consent dialog; the endpoint stays settable so
 # self-hosters can point at their own collector or air-gap it.
-MAX_SETTINGS_FIELDS = 129
+# 129 -> 130: timeout_invariant_validation_strict (#1622). This stays
+# operator-selectable because startup invariant failures need two supported
+# modes: report-only by default for mixed/self-hosted environments, and
+# fail-fast when CI or strict operators want config drift to abort startup.
+MAX_SETTINGS_FIELDS = 131
 
 
 def test_generated_settings_reference_matches_code() -> None:

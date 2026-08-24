@@ -58,5 +58,6 @@ certs/
 .omx/
 PROMPT.md
 SUMMARY.md
+DECISIONS.md
 .superpowers/
 .agents/worktrees/

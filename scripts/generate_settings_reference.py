@@ -265,7 +265,9 @@ def render_settings_reference() -> str:
             "[rate-limit-reset-credits]"
             "(https://github.com/Soju06/codex-lb/tree/main/openspec/specs/rate-limit-reset-credits) · "
             "[deployment-installation]"
-            "(https://github.com/Soju06/codex-lb/tree/main/openspec/specs/deployment-installation)*",
+            "(https://github.com/Soju06/codex-lb/tree/main/openspec/specs/deployment-installation) · "
+            "[proxy-runtime-observability]"
+            "(https://github.com/Soju06/codex-lb/tree/main/openspec/specs/proxy-runtime-observability)*",
             "",
         ]
     )

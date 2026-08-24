@@ -1,7 +1,9 @@
-# Architectural Decisions
+# Context: proxy-architecture
 
-This file records long-lived architecture decisions for codex-lb. New decisions
-are appended and superseded by later entries rather than edited in place.
+Normative requirements live in [`spec.md`](./spec.md). This document carries
+free-form context for the proxy-architecture capability: architecture decision
+records (ADRs) are appended here and superseded by later entries rather than
+edited in place. Relocated from the former repository-root `DECISIONS.md`.
 
 ## ADR-0001: ProxyService target-architecture cutover refactor
 

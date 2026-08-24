@@ -733,7 +733,9 @@ class ResponsesRequest(BaseModel):
         return payload
 
     def to_payload(self) -> JsonObject:
-        return _strip_unsupported_fields(self.model_dump_for_forwarding())
+        payload = _strip_unsupported_fields(self.model_dump_for_forwarding())
+        _normalize_compaction_trigger_singleton(payload)
+        return payload
 
     def to_replay_safety_payload(self) -> JsonObject:
         return _strip_unsupported_fields(self.model_dump_for_forwarding(), strip_replayed_tool_call_namespaces=False)
@@ -986,6 +988,7 @@ def _strip_compact_unsupported_fields(payload: MutableJsonObject) -> MutableJson
     if is_json_mapping(normalized_payload):
         payload = dict(normalized_payload)
     _trim_compact_input_for_upstream(payload)
+    _normalize_compaction_trigger_singleton(payload)
     payload.pop("store", None)
     payload.pop("text", None)
     payload.pop("tools", None)
@@ -993,6 +996,21 @@ def _strip_compact_unsupported_fields(payload: MutableJsonObject) -> MutableJson
     payload.pop("client_metadata", None)
     payload["parallel_tool_calls"] = False
     return payload
+
+
+def _normalize_compaction_trigger_singleton(payload: MutableJsonObject) -> None:
+    input_value = payload.get("input")
+    if not is_json_list(input_value) or not input_value:
+        return
+
+    trigger_items = [item for item in input_value if is_json_mapping(item) and item.get("type") == "compaction_trigger"]
+    if not trigger_items:
+        return
+
+    payload["input"] = [
+        item for item in input_value if not (is_json_mapping(item) and item.get("type") == "compaction_trigger")
+    ]
+    cast(list[JsonValue], payload["input"]).append({"type": "compaction_trigger"})
 
 
 def _trim_compact_input_for_upstream(payload: MutableJsonObject) -> None:
@@ -1200,6 +1218,12 @@ def _compact_discard_consumed_continuity_output_pairs(
     latest_index = len(input_value) - 1
     latest_mapping = _json_mapping_or_none(input_value[latest_index])
     latest_type = latest_mapping.get("type") if latest_mapping is not None else None
+    if latest_type == "compaction_trigger":
+        if latest_index == 0:
+            return
+        latest_index -= 1
+        latest_mapping = _json_mapping_or_none(input_value[latest_index])
+        latest_type = latest_mapping.get("type") if latest_mapping is not None else None
     if (
         latest_mapping is None
         or not isinstance(latest_type, str)
@@ -1233,33 +1257,55 @@ def _compact_terminal_required_indices(
     latest_index = len(input_value) - 1
     latest_mapping = _json_mapping_or_none(input_value[latest_index])
     latest_type = latest_mapping.get("type") if latest_mapping is not None else None
+    terminal_trigger_indices: set[int] = set()
+    if latest_type == "compaction_trigger":
+        terminal_trigger_indices.add(latest_index)
+        if latest_index == 0:
+            return terminal_trigger_indices, True, False
+        latest_index -= 1
+        latest_mapping = _json_mapping_or_none(input_value[latest_index])
+        latest_type = latest_mapping.get("type") if latest_mapping is not None else None
+
+    def with_terminal_trigger(indices: set[int]) -> set[int]:
+        return indices | terminal_trigger_indices
+
     if latest_type not in _COMPACT_TOOL_CALL_ITEM_TYPES | _COMPACT_TOOL_CALL_OUTPUT_ITEM_TYPES:
-        return {latest_index}, True, False
+        return with_terminal_trigger({latest_index}), True, False
     if latest_mapping is not None and _compact_item_is_state_anchor(latest_mapping):
-        return _compact_required_terminal_indices(input_value, latest_index, token_counts), True, True
+        terminal_indices = _compact_required_terminal_indices(input_value, latest_index, token_counts)
+        return with_terminal_trigger(terminal_indices), True, True
     if latest_mapping is not None and _compact_item_has_elidable_inline_image(latest_mapping):
-        return _compact_required_terminal_indices(input_value, latest_index, token_counts), True, True
+        terminal_indices = _compact_required_terminal_indices(input_value, latest_index, token_counts)
+        return with_terminal_trigger(terminal_indices), True, True
     matching_call_index = _compact_matching_tool_call_index(input_value, latest_index)
     if latest_mapping is not None and _compact_terminal_item_is_side_effect(
         input_value,
         latest_index,
         matching_call_index=matching_call_index,
     ):
-        return _compact_required_terminal_indices(input_value, latest_index, token_counts), True, True
+        terminal_indices = _compact_required_terminal_indices(input_value, latest_index, token_counts)
+        return with_terminal_trigger(terminal_indices), True, True
     if latest_type in _COMPACT_TOOL_CALL_OUTPUT_ITEM_TYPES and has_continuity_anchor and matching_call_index is None:
-        return {latest_index}, True, False
+        return with_terminal_trigger({latest_index}), True, False
     if latest_type in _COMPACT_TOOL_CALL_ITEM_TYPES:
-        return _compact_required_terminal_indices(input_value, latest_index, token_counts), True, True
+        terminal_indices = _compact_required_terminal_indices(input_value, latest_index, token_counts)
+        return with_terminal_trigger(terminal_indices), True, True
+
+    if terminal_trigger_indices:
+        # The trigger is the only mandatory suffix sentinel. An ordinary
+        # matched tool pair immediately before it remains best-effort context
+        # and may be dropped when other anchors consume the wire budget.
+        return terminal_trigger_indices, True, False
 
     paired_tail = _compact_reconciled_tool_call_indices(
         input_value,
-        {latest_index},
+        with_terminal_trigger({latest_index}),
         token_counts=token_counts,
         token_budget=_MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS,
     )
     if latest_index in paired_tail:
         return paired_tail, False, False
-    return set(), False, False
+    return terminal_trigger_indices, bool(terminal_trigger_indices), False
 
 
 def _compact_item_has_elidable_inline_image(item: JsonValue) -> bool:

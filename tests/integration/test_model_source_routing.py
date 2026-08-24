@@ -41,6 +41,7 @@ async def _create_model_source(
     supports_responses: bool = False,
     supports_streaming: bool = True,
     supports_audio_transcriptions: bool = False,
+    supports_embeddings: bool = False,
 ) -> str:
     model_entry: dict[str, object] = {
         "model": model,
@@ -69,6 +70,7 @@ async def _create_model_source(
             "supportsChatCompletions": True,
             "supportsResponses": supports_responses,
             "supportsAudioTranscriptions": supports_audio_transcriptions,
+            "supportsEmbeddings": supports_embeddings,
             "models": [model_entry],
         },
     )
@@ -2371,6 +2373,34 @@ async def test_v1_models_metadata_reflects_reasoning_optin(async_client):
 
 
 @pytest.mark.asyncio
+async def test_v1_models_context_window_override_applies_to_source_model(async_client, monkeypatch):
+    # Source-catalog models synthesize `max_context_window == context_window`
+    # purely so Codex clients can parse the entry; that parseability default
+    # must not clamp an operator raise override to the un-raised window.
+    await _create_model_source(
+        async_client,
+        name="override-source",
+        model="override-source-model",
+        base_url="http://127.0.0.1:9/v1",
+    )
+
+    from app.core.config.settings import get_settings
+    from app.modules.proxy import api as proxy_api_module
+
+    patched = get_settings().model_copy(update={"model_context_window_overrides": {"override-source-model": 32_768}})
+    monkeypatch.setattr(proxy_api_module, "get_settings", lambda: patched)
+
+    response = await async_client.get("/v1/models")
+    assert response.status_code == 200
+    item = next(m for m in response.json()["data"] if m["id"] == "override-source-model")
+    assert item["metadata"]["context_window"] == 32_768
+    assert item["metadata"]["input_context_window"] == 32_768
+    assert item["capabilities"]["context_length"] == 32_768
+    assert item["contextLength"] == 32_768
+    assert item["context_length"] == 32_768
+
+
+@pytest.mark.asyncio
 async def test_source_chat_payload_keeps_reasoning_toggles_for_optin_model(async_client, source_upstream):
     captured: dict[str, object] = {}
 
@@ -3298,3 +3328,222 @@ async def test_codex_responses_payload_restores_declared_minimal_effort(async_cl
     reasoning = captured["reasoning"]
     assert isinstance(reasoning, dict)
     assert reasoning["effort"] == "minimal"
+
+
+@pytest.mark.asyncio
+async def test_source_embeddings_routes_payload_and_settles_usage(async_client, source_upstream) -> None:
+    await _enable_api_key_auth(async_client)
+    captured: dict[str, object] = {}
+
+    async def embed(request: web.Request) -> web.Response:
+        captured["path"] = request.path
+        captured["authorization"] = request.headers.get("authorization")
+        captured["payload"] = await request.json()
+        return web.json_response(
+            {
+                "object": "list",
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3]}],
+                "model": "all-minilm:latest",
+                "usage": {"prompt_tokens": 21, "total_tokens": 21},
+            }
+        )
+
+    base_url = await source_upstream(embed)
+    model = "all-minilm:latest"
+    source_id = await _create_model_source(
+        async_client,
+        name="embedder",
+        model=model,
+        base_url=base_url,
+        input_per_1m=0.02,
+        supports_embeddings=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "embeddings-source-key",
+            "assignedSourceIds": [source_id],
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 1_000},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    key = created.json()["key"]
+
+    response = await async_client.post(
+        "/v1/embeddings",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "input": ["hello", "world"], "encoding_format": "float"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["object"] == "list"
+    assert body["data"][0]["embedding"] == [0.1, 0.2, 0.3]
+    assert captured["path"] == "/v1/embeddings"
+    assert captured["authorization"] == "Bearer token-embedder"
+    # Extra OpenAI params pass through verbatim.
+    assert captured["payload"] == {
+        "model": model,
+        "input": ["hello", "world"],
+        "encoding_format": "float",
+    }
+
+    async with SessionLocal() as session:
+        result = await session.execute(select(RequestLog).where(RequestLog.model == model))
+        log = result.scalar_one()
+        assert log.account_id is None
+        assert log.model_source_id == source_id
+        assert log.source == "model_source"
+        assert log.input_tokens == 21
+        assert log.output_tokens == 0
+        assert log.status == "success"
+
+
+@pytest.mark.asyncio
+async def test_source_embeddings_unknown_model_returns_model_not_found(async_client) -> None:
+    await _enable_api_key_auth(async_client)
+    created = await async_client.post("/api/api-keys/", json={"name": "embeddings-404-key"})
+    assert created.status_code == 200
+    key = created.json()["key"]
+
+    response = await async_client.post(
+        "/v1/embeddings",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "no-such-embedder", "input": "hello"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "model_not_found"
+
+    # Rejection happens before source selection succeeds, so no source was
+    # contacted: the attempt must not appear in the request log at all.
+    async with SessionLocal() as session:
+        result = await session.execute(select(RequestLog).where(RequestLog.model == "no-such-embedder"))
+        assert result.scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_source_embeddings_transport_failure_logs_without_upstream_status(async_client) -> None:
+    await _enable_api_key_auth(async_client)
+    model = "unreachable-embedder"
+    closed_port = _free_port()
+    source_id = await _create_model_source(
+        async_client,
+        name="unreachable-embedder-source",
+        model=model,
+        base_url=f"http://127.0.0.1:{closed_port}/v1",
+        supports_embeddings=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "embeddings-unreachable-key", "assignedSourceIds": [source_id]},
+    )
+    assert created.status_code == 200
+    key = created.json()["key"]
+
+    response = await async_client.post(
+        "/v1/embeddings",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "input": "hello"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "model_source_unreachable"
+
+    # The attempt reached dispatch, so it is logged -- but no upstream response
+    # ever arrived, so there is no upstream status code to carry.
+    async with SessionLocal() as session:
+        result = await session.execute(select(RequestLog).where(RequestLog.model == model))
+        log = result.scalar_one()
+        assert log.status == "error"
+        assert log.model_source_id == source_id
+        assert log.upstream_status_code is None
+
+
+@pytest.mark.asyncio
+async def test_source_embeddings_upstream_error_passes_through_and_logs(async_client, source_upstream) -> None:
+    await _enable_api_key_auth(async_client)
+
+    async def embed(request: web.Request) -> web.Response:
+        return web.json_response(
+            {"error": {"message": "model exploded", "type": "server_error"}},
+            status=500,
+        )
+
+    base_url = await source_upstream(embed)
+    model = "broken-embedder"
+    source_id = await _create_model_source(
+        async_client,
+        name="broken-embedder-source",
+        model=model,
+        base_url=base_url,
+        supports_embeddings=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "embeddings-error-key", "assignedSourceIds": [source_id]},
+    )
+    assert created.status_code == 200
+    key = created.json()["key"]
+
+    response = await async_client.post(
+        "/v1/embeddings",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "input": "hello"},
+    )
+
+    assert response.status_code == 500
+    assert "model exploded" in response.json()["error"]["message"]
+
+    async with SessionLocal() as session:
+        result = await session.execute(select(RequestLog).where(RequestLog.model == model))
+        log = result.scalar_one()
+        assert log.status == "error"
+        assert log.model_source_id == source_id
+
+
+@pytest.mark.asyncio
+async def test_source_embeddings_without_usage_fails_closed_for_limited_key(async_client, source_upstream) -> None:
+    await _enable_api_key_auth(async_client)
+
+    async def embed(request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "object": "list",
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.5]}],
+                "model": "usage-less-embedder",
+            }
+        )
+
+    base_url = await source_upstream(embed)
+    model = "usage-less-embedder"
+    source_id = await _create_model_source(
+        async_client,
+        name="usage-less-embedder-source",
+        model=model,
+        base_url=base_url,
+        supports_embeddings=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "embeddings-limited-key",
+            "assignedSourceIds": [source_id],
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 1_000},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    key = created.json()["key"]
+
+    response = await async_client.post(
+        "/v1/embeddings",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "input": "hello"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "usage_unavailable"

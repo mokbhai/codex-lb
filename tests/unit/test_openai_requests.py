@@ -175,17 +175,18 @@ def test_strip_unsupported_fields_namespace_flag_controls_replayed_calls(namespa
     assert stripped["input"] == [{"type": "function_call"}]
 
 
-def test_responses_preserves_service_tier():
+@pytest.mark.parametrize("service_tier", ["priority", "ultrafast"])
+def test_responses_preserves_service_tier(service_tier: str):
     payload = {
         "model": "gpt-5.1",
         "instructions": "hi",
         "input": [],
-        "service_tier": "priority",
+        "service_tier": service_tier,
     }
     request = ResponsesRequest.model_validate(payload)
 
     dumped = request.to_payload()
-    assert dumped["service_tier"] == "priority"
+    assert dumped["service_tier"] == service_tier
 
 
 def test_responses_normalizes_fast_service_tier_to_priority_for_upstream():
@@ -579,16 +580,17 @@ def test_openai_compatible_top_level_verbosity_is_normalized():
     assert "verbosity" not in dumped
 
 
-def test_v1_responses_preserves_service_tier():
+@pytest.mark.parametrize("service_tier", ["priority", "ultrafast"])
+def test_v1_responses_preserves_service_tier(service_tier: str):
     payload = {
         "model": "gpt-5.1",
         "input": "hello",
-        "service_tier": "priority",
+        "service_tier": service_tier,
     }
     request = V1ResponsesRequest.model_validate(payload).to_responses_request()
 
     dumped = request.to_payload()
-    assert dumped["service_tier"] == "priority"
+    assert dumped["service_tier"] == service_tier
 
 
 def test_v1_responses_normalizes_fast_service_tier_to_priority_for_upstream():

@@ -33,7 +33,7 @@ class ApiKeyCreateRequest(DashboardModel):
         default=None, pattern=r"(?i)^(none|minimal|low|medium|high|xhigh|max|ultra)$"
     )
     allowed_reasoning_efforts: list[str] | None = None
-    enforced_service_tier: str | None = Field(default=None, pattern=r"(?i)^(auto|default|priority|flex|fast)$")
+    enforced_service_tier: str | None = Field(default=None, pattern=r"(?i)^(auto|default|priority|flex|(ultra)?fast)$")
     traffic_class: str | None = Field(default=None, pattern=r"(?i)^(foreground|opportunistic)$")
     transport_policy_override: str | None = None
     usage_sections: str | None = None
@@ -53,7 +53,7 @@ class ApiKeyUpdateRequest(DashboardModel):
         default=None, pattern=r"(?i)^(none|minimal|low|medium|high|xhigh|max|ultra)$"
     )
     allowed_reasoning_efforts: list[str] | None = None
-    enforced_service_tier: str | None = Field(default=None, pattern=r"(?i)^(auto|default|priority|flex|fast)$")
+    enforced_service_tier: str | None = Field(default=None, pattern=r"(?i)^(auto|default|priority|flex|(ultra)?fast)$")
     traffic_class: str | None = Field(default=None, pattern=r"(?i)^(foreground|opportunistic)$")
     transport_policy_override: str | None = None
     usage_sections: str | None = None

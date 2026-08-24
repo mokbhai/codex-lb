@@ -60,6 +60,7 @@ export function TelemetryConsentDialog() {
           <p className="text-sm text-muted-foreground">
             {t("settings.telemetry.consentDialog.categories")}
           </p>
+          <p className="text-sm text-muted-foreground">{t("settings.telemetry.optOutNotice")}</p>
           <p className="text-sm font-medium">{t("settings.telemetry.consentDialog.payloadLabel")}</p>
           <TelemetryPayloadPreview preview={preview} />
           <p className="text-sm">
